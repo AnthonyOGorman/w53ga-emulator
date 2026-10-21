@@ -36,7 +36,7 @@ worker.onmessage = (e) => {
     case 'started':
       started = true; running = true; paused = false; startedMode = m.mode;
       $('overlay').classList.add('hidden');
-      msg([m.mode === 'power-on' ? 'Switched on: the unit boots from reset (about 45 s to the map).' : 'State resumed.', m.note, m.profile ? `HLE profile: ${m.profile}.` : 'No HLE profile: 2D graphics calls are not drawn.', m.skipped ? `Skipped (not 8.3 names): ${m.skipped}` : ''].filter(Boolean).join(' '), 'ok');
+      msg([m.mode === 'power-on' ? 'Switched on: the unit boots from reset (about 45 s to the map).' : 'State resumed.', m.note, m.profile ? `HLE profile: ${m.profile}.` : 'HLE off: 2D graphics calls are not drawn.', m.skipped ? `Skipped (not 8.3 names): ${m.skipped}` : ''].filter(Boolean).join(' '), 'ok');
       refresh();
       break;
     case 'stopped': running = false; msg('Stopped: ' + m.reason, 'err'); refresh(); break;
@@ -170,7 +170,6 @@ function refresh() {
     if (!files.rl78 && !files.state) need.push('the controller image');
     if (!sd && !files.state) need.push('your SD card folder');
     if (!powerOnAvailable && !files.poweron && !files.state) need.push('the power-on state (More files)');
-    if (!files.profile && !files.state) need.push('an HLE profile (More files; without it the screen stays black)');
     if (!wasmReady) need.push('the emulator to finish loading');
     $('overlay').querySelector('.big').textContent = haveFlash ? 'Ready when you are' : 'Drop your flash image here';
     $('overlay').lastElementChild.innerHTML = need.length ? 'Still needed: ' + need.join(', ') + '.' : 'Press <b>Power on</b> to switch the unit on.';

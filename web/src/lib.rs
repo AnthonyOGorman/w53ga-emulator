@@ -72,8 +72,8 @@ pub unsafe extern "C" fn emu_set_power_on_state(p: *const u8, n: usize) -> i32 {
     match w53ga_emu::checkpoint::set_power_on_state(bytes(p, n).to_vec()) { Ok(()) => 0, Err(e) => err(e) }
 }
 
-/// Use an HLE profile (JSON) for machines created from now on; an empty string goes back to automatic choice among
-/// the built-in profiles. 0, or -1 with the message.
+/// Use an HLE profile (JSON) for machines created from now on; an empty string goes back to automatic choice (a
+/// matching built-in profile, else runtime detection). 0, or -1 with the message.
 /// # Safety
 /// `p` must point to `n` readable bytes.
 #[no_mangle]
@@ -83,8 +83,8 @@ pub unsafe extern "C" fn emu_set_profile(p: *const u8, n: usize) -> i32 {
     match w53ga_emu::hle::Profile::parse(&json) { Ok(pr) => { PROFILE.with(|x| *x.borrow_mut() = Some(pr)); 0 } Err(e) => err(e) }
 }
 
-/// Apply the chosen (or a matching built-in) HLE profile to the machine. Err if a chosen profile does not match the
-/// flash image.
+/// Apply the chosen (or a matching built-in) HLE profile to the machine; with neither, the hooks are detected at run
+/// time (`w53ga_emu::detect`). Err if a chosen profile does not match the flash image.
 fn apply_profile(m: &mut Machine) -> Result<(), String> {
     let chosen = PROFILE.with(|x| x.borrow().clone());
     let p = match chosen { Some(p) => { p.verify(&m.cpu.mem.flash)?; Some(p) } None => w53ga_emu::hle::detect(&m.cpu.mem.flash) };

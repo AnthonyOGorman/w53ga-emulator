@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AR-W53GA emulator</title>
+<meta name="description" content="A hardware emulator for the AR-W53GA car unit that runs entirely in your browser. You supply the flash image and SD card; nothing is uploaded.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='2' y='7' width='28' height='18' rx='4' fill='%231e2430'/%3E%3Crect x='5' y='10' width='22' height='12' rx='1' fill='%2338bdf8'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><rect x="2" y="7" width="28" height="18" rx="4"/><rect class="glass" x="5" y="10" width="22" height="12" rx="1"/></svg>
+    <div>
+      <h1>AR-W53GA emulator</h1>
+      <p class="sub">SH-2A + RL78 hardware emulation in WebAssembly</p>
+    </div>
+  </div>
+  <div class="privacy" title="The page reads the files you choose directly in this browser tab. They are never sent anywhere.">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 4 5v6c0 5 3.4 9.4 8 11 4.6-1.6 8-6 8-11V5l-8-3Zm-1.2 14.2-3.5-3.5 1.4-1.4 2.1 2.1 4.8-4.8 1.4 1.4-6.2 6.2Z"/></svg>
+    <span><b>Runs entirely in your browser.</b> Your files are never uploaded.</span>
+  </div>
+</header>
+
+<main class="layout">
+  <section class="stage" aria-label="Device">
+    <div class="bezel" id="bezel">
+      <canvas id="screen" width="400" height="240" aria-label="Unit screen"></canvas>
+      <div class="screen-overlay" id="overlay">
+        <p class="big">Drop your flash image here</p>
+        <p>or choose your files on the right, then press <b>Power on</b>.</p>
+      </div>
+      <div class="led" id="led" title="Emulator state"></div>
+    </div>
+    <div class="statusbar" role="status" aria-live="polite">
+      <span class="pill" id="st-state"><i class="dot"></i><span>Off</span></span>
+      <span class="pill speed" id="st-speed" title="Emulated time per wall-clock time"><span class="meter"><span id="speedfill"></span></span><span id="speedtxt">–</span></span>
+      <span class="pill" id="st-time">0.0 s</span>
+      <span class="pill" id="st-gps" hidden></span>
+      <span class="pill" id="st-acc" hidden></span>
+      <span class="pill" id="st-sd" hidden></span>
+    </div>
+    <div class="actions">
+      <span class="scale" role="group" aria-label="Screen scale">
+        <button data-scale="0" class="on" title="Largest whole-number scale that fits">Fit</button><button data-scale="1">1×</button><button data-scale="2">2×</button><button data-scale="3">3×</button>
+      </span>
+      <button id="btn-power" class="primary" disabled>Power on</button>
+      <button id="btn-resume" disabled title="Continue from a saved state">Resume state</button>
+      <button id="btn-pause" disabled>Pause</button>
+      <button id="btn-shot" disabled title="Save the screen as a PNG">Screenshot</button>
+      <button id="btn-save" disabled title="Download the complete machine state (it contains your flash image and RAM: keep it private)">Save state</button>
+      <button id="btn-sdsave" disabled title="Write what the unit changed on the SD card back to your folder">Write SD changes</button>
+    </div>
+    <p class="msg" id="msg" role="alert"></p>
+
+    <section class="card remote" aria-label="Remote control">
+      <h2>Remote</h2>
+      <div class="remote-body">
+        <div class="dpad">
+          <button data-k="0" class="up" aria-label="Up">▲</button>
+          <button data-k="2" class="left" aria-label="Left">◀</button>
+          <button data-k="9" class="ent">ENT</button>
+          <button data-k="8" class="right" aria-label="Right">▶</button>
+          <button data-k="1" class="down" aria-label="Down">▼</button>
+        </div>
+        <div class="keys">
+          <button data-k="10" class="back">BACK</button>
+          <div class="fkeys">
+            <button data-k="16" title="F1">0x10</button><button data-k="17" title="F2">0x11</button><button data-k="18" title="F3">0x12</button><button data-k="100" title="F4">0x64</button><button data-k="255" title="F5">0xFF</button>
+          </div>
+          <p class="hint">Keyboard: <kbd>←</kbd><kbd>↑</kbd><kbd>↓</kbd><kbd>→</kbd> <kbd>Enter</kbd> ENT, <kbd>Backspace</kbd> BACK, <kbd>F1</kbd>–<kbd>F5</kbd> the other buttons, <kbd>P</kbd> pause, <kbd>S</kbd> screenshot.</p>
+        </div>
+      </div>
+    </section>
+  </section>
+
+  <aside class="side">
+    <section class="card files" aria-label="Your files">
+      <h2>Your files <span class="tag">stay on this computer</span></h2>
+      <div class="file-row" id="row-flash">
+        <div class="fl"><b>Flash image</b><span class="note">32 MiB dump of your unit's NOR flash</span></div>
+        <label class="pick"><input id="in-flash" type="file" accept=".bin,.rom,.img,application/octet-stream">Choose…</label>
+        <span class="val" id="val-flash">not chosen</span>
+      </div>
+      <div class="file-row" id="row-rl78">
+        <div class="fl"><b>Controller image</b><span class="note">RL78 code flash: 1 MiB image or an update package carrying one</span></div>
+        <label class="pick"><input id="in-rl78" type="file" accept=".bin">Choose…</label>
+        <span class="val" id="val-rl78">not chosen</span>
+      </div>
+      <div class="file-row" id="row-sd">
+        <div class="fl"><b>SD card folder</b><span class="note" id="sd-mode-note">a copy of your card's contents</span></div>
+        <button class="pick" id="btn-sd">Choose folder…</button>
+        <input id="in-sd" type="file" webkitdirectory multiple hidden>
+        <span class="val" id="val-sd">not chosen</span>
+      </div>
+      <div class="file-row compact">
+        <label class="fl" for="in-cid"><b>Card CID</b><span class="note">optional: your card's 32-digit CID, for map data bound to it</span></label>
+        <input id="in-cid" class="text mono" placeholder="e.g. 0353445355303847…" spellcheck="false" autocomplete="off">
+      </div>
+      <details class="adv">
+        <summary>More files</summary>
+        <div class="file-row">
+          <div class="fl"><b>Saved state</b><span class="note">resume where you left off</span></div>
+          <label class="pick"><input id="in-state" type="file" accept=".state">Choose…</label>
+          <span class="val" id="val-state">none</span>
+        </div>
+        <div class="file-row">
+          <div class="fl"><b>HLE profile</b><span class="note">optional .json (see README, "HLE profiles")</span></div>
+          <label class="pick"><input id="in-profile" type="file" accept=".json,application/json">Choose…</label>
+          <span class="val" id="val-profile">automatic</span>
+        </div>
+        <div class="file-row" id="row-poweron" hidden>
+          <div class="fl"><b>Power-on state</b><span class="note">this build has none built in: power-on.json.gz</span></div>
+          <label class="pick"><input id="in-poweron" type="file" accept=".gz">Choose…</label>
+          <span class="val" id="val-poweron">needed</span>
+        </div>
+      </details>
+    </section>
+
+    <section class="card" aria-label="Accessories">
+      <h2>Accessories</h2>
+      <div class="toggles">
+        <label class="switch"><input id="acc-obd2" type="checkbox" checked><span></span>OBD-II adapter</label>
+        <label class="switch"><input id="acc-dvr" type="checkbox" checked><span></span>Drive recorder + camera</label>
+        <label class="switch" title="Needs the local server (w53ga-serve): browsers cannot open network sockets themselves"><input id="acc-wifi" type="checkbox"><span></span>Wi-Fi module</label>
+      </div>
+      <div class="wifi-row" id="wifi-row" hidden>
+        <input id="in-ssid" class="text" value="W53GA-NET" title="Access point: SSID[:passphrase]; * accepts any key" spellcheck="false">
+        <span class="note">Bridged to your network through <code>w53ga-serve</code> only.</span>
+      </div>
+    </section>
+
+    <section class="card gps" aria-label="GPS">
+      <h2>GPS</h2>
+      <div class="seg" role="tablist">
+        <button role="tab" data-tab="route" class="on">Route</button><button role="tab" data-tab="drive">Drive</button><button role="tab" data-tab="map">Map</button>
+      </div>
+      <div class="tab" data-pane="route">
+        <div class="row">
+          <select id="route-sample" aria-label="Route">
+            <option value="">Choose a route…</option>
+            <option value="routes/tokyo-palace-loop.txt">Sample: round the Imperial Palace, Tokyo (6.5 km)</option>
+          </select>
+          <label class="pick small"><input id="in-route" type="file" accept=".txt,.csv">Load file…</label>
+        </div>
+        <p class="note">A route is one <code>lat,lon</code> per line. It is driven round and round when it ends where it starts.</p>
+      </div>
+      <div class="tab" data-pane="drive" hidden>
+        <div class="drive">
+          <button id="drv-left" aria-label="Turn left">⟲ 15°</button>
+          <div class="compass"><span id="drv-heading">0°</span><small>heading</small></div>
+          <button id="drv-right" aria-label="Turn right">15° ⟳</button>
+        </div>
+        <div class="row"><label for="drv-lat">Start at</label><input id="drv-lat" class="text mono" value="35.6812" size="9"><input id="drv-lon" class="text mono" value="139.7671" size="9"><button id="drv-go">Go</button></div>
+      </div>
+      <div class="tab" data-pane="map" hidden>
+        <p class="note" id="map-note">The map loads tiles from <b>tile.openstreetmap.org</b> (only map images are fetched; none of your files). Click to drive there, Shift-click to jump.</p>
+        <button id="map-enable">Show map</button>
+        <div id="map" hidden></div>
+      </div>
+      <div class="row speedrow"><label for="gps-speed">Speed</label><input id="gps-speed" type="range" min="0" max="180" value="40"><output id="gps-speed-v">40 km/h</output></div>
+    </section>
+
+    <details class="card obd" aria-label="OBD-II values">
+      <summary><h2>OBD-II values</h2></summary>
+      <label class="switch"><input id="obd-follow" type="checkbox" checked><span></span>Speed and engine speed follow the GPS</label>
+      <div class="grid" id="obd-grid"></div>
+    </details>
+  </aside>
+</main>
+
+<footer class="foot">
+  <p>Independent open-source project; not affiliated with or endorsed by the unit's manufacturer. Product names are trademarks of their owners.
+  This page contains no software for the unit: it emulates the hardware and runs the files you choose, locally.</p>
+</footer>
+
+<div class="dropzone" id="dropzone" hidden><div>Drop files or your SD card folder</div></div>
+<script src="app.js"></script>
+</body>
+</html>

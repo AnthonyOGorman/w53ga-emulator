@@ -1,0 +1,35 @@
+# Publishes the browser version (web/www plus the WebAssembly build) to GitHub Pages. It runs only when started by
+# hand (Actions > Pages > Run workflow) and needs Pages set to "GitHub Actions" in the repository settings.
+# The page is static: visitors' files are read by their own browser and are never sent to GitHub or anywhere else.
+name: Pages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - run: sh scripts/build-web.sh
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/www
+      - id: deployment
+        uses: actions/deploy-pages@v4

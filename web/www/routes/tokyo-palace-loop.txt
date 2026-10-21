@@ -1,0 +1,17 @@
+# A loop of about 6.5 km round the Imperial Palace in central Tokyo (straight lines between these points).
+# One "latitude,longitude" per line (WGS84 degrees). Lines starting with # are ignored.
+35.6812,139.7671
+35.6785,139.7650
+35.6750,139.7630
+35.6742,139.7575
+35.6770,139.7525
+35.6808,139.7470
+35.6840,139.7440
+35.6885,139.7468
+35.6930,139.7510
+35.6918,139.7550
+35.6905,139.7570
+35.6880,139.7612
+35.6860,139.7640
+35.6835,139.7662
+35.6812,139.7671

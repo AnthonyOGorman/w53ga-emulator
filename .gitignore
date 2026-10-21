@@ -1,0 +1,44 @@
+# Build output
+/target/
+/web/target/
+/web/www/w53ga_web.wasm
+*.wasm
+
+# Never commit anything from a unit: flash dumps, controller images, update packages, saved states (they contain the
+# flash image and RAM), SD card copies, or anything the emulator writes.
+*.bin
+*.BIN
+*.rom
+*.img
+*.state
+*.spi
+*.dump
+*.bmp
+*.wav
+# Optional build-time inputs that the repository does not ship (see README, "Power-on state" and "HLE profiles").
+/data/
+/profiles/
+/states/
+/dumps/
+/flash/
+/sd/
+/SD/
+/sdcard/
+/SDCard*/
+/card/
+/CELLSTAR/
+/MAP/
+/SOUND/
+screenshot-*.png
+w53ga-*.png
+w53ga-*.state
+*.local.*
+.env
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -42,7 +42,7 @@ write SD card changes back).
 | **Flash image** | A complete read of the main board's 32 MiB parallel NOR flash (exactly 33,554,432 bytes). It holds the boot loader, the main program, its graphics and the unit's settings. |
 | **Controller image** | The RL78/G13 controller's code flash: a 1 MiB image of both 512 KiB banks, or an update package that carries one behind an 88-byte header. |
 | **SD card folder** | A copy of the files on the unit's microSD card (map, sound and data files). The emulator builds a virtual FAT32 SDHC card from the folder on the fly; nothing is copied. |
-| **Card CID** *(optional)* | The 16-byte card identification register of your card, as 32 hex digits. Some data on the card may be bound to the card it was written to; to use such files, give the CID of the card they came from (Linux shows it in `/sys/block/mmcblk0/device/cid` for a card in a built-in reader; most USB readers do not expose it). |
+| **Card CID** | The 16-byte card identification register of your card, as 32 hex digits. The unit's map database is bound to the card it was written to: without that card's CID the unit runs but its map stays blank (Linux shows it in `/sys/block/mmcblk0/device/cid` for a card in a built-in reader; most USB readers do not expose it). |
 | **HLE profile** *(see below)* | A small JSON file naming a few entry points in your main program, needed to draw the screen's 2D graphics. |
 
 How you read these from your own hardware is up to you and outside the scope of this project; use only what you are
@@ -250,11 +250,10 @@ screens stay dark), and it runs more slowly. This repository ships no profile.
 ## Power-on state
 
 Switching the unit on starts from the SH7269's power-on reset state: every on-chip register at its documented reset
-value and the peripheral models in their initial state, as a small JSON file (`data/power-on.json.gz`). It contains no
-memory contents (RAM starts zeroed) and no program counter or stack pointer: the emulator reads those from the flash
-image's reset vectors, as the chip does. When `data/power-on.json.gz` is present at build time it is built in;
-otherwise give it at run time (`--power-on-state FILE`, or *More files → Power-on state* in the page). Saved states can
-be resumed without it.
+value (each entry cites the page of the Renesas hardware manual it comes from) and the peripheral models in their
+initial state. It is built in (`data/power-on.json.gz`, embedded at build time) and contains no memory contents and no
+program counter or stack pointer: the emulator reads those from the flash image's reset vectors, as the chip does.
+`--power-on-state FILE` (or *More files → Power-on state* in the page) can still replace it for experiments.
 
 ## Accuracy and limitations
 

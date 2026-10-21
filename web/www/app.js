@@ -169,6 +169,9 @@ function refresh() {
     if (!haveFlash) need.push('your flash image');
     if (!files.rl78 && !files.state) need.push('the controller image');
     if (!sd && !files.state) need.push('your SD card folder');
+    if (!powerOnAvailable && !files.poweron && !files.state) need.push('the power-on state (More files)');
+    if (!files.profile && !files.state) need.push('an HLE profile (More files; without it the screen stays black)');
+    if (!wasmReady) need.push('the emulator to finish loading');
     $('overlay').querySelector('.big').textContent = haveFlash ? 'Ready when you are' : 'Drop your flash image here';
     $('overlay').lastElementChild.innerHTML = need.length ? 'Still needed: ' + need.join(', ') + '.' : 'Press <b>Power on</b> to switch the unit on.';
   }

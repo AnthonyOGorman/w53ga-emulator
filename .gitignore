@@ -1,5 +1,6 @@
 # Build output
 /target/
+/target-*/
 /web/target/
 /web/www/w53ga_web.wasm
 *.wasm
@@ -15,8 +16,7 @@
 *.dump
 *.bmp
 *.wav
-# Optional build-time inputs that the repository does not ship (see README, "Power-on state" and "HLE profiles").
-/data/
+# Optional build-time input the repository does not ship (see README, "HLE profiles").
 /profiles/
 /states/
 /dumps/

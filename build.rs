@@ -1,4 +1,4 @@
-//! Optional data embedded at build time. The repository ships none of it; both can also be given at run time.
+//! Data embedded at build time: the power-on reset state (shipped) and HLE profiles (not shipped; both can also be given at run time).
 //!
 //! - `data/power-on.json.gz`: the SH7269 power-on reset state (register reset values and the peripheral models'
 //!   initial state; no memory contents, no PC/SP, which come from the flash image's vector table). Without it, a power-on

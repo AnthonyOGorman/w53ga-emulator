@@ -43,7 +43,7 @@ write SD card changes back).
 | **Controller image** | The RL78/G13 controller's code flash: a 1 MiB image of both 512 KiB banks, or an update package that carries one behind an 88-byte header. |
 | **SD card folder** | A copy of the files on the unit's microSD card (map, sound and data files). The emulator builds a virtual FAT32 SDHC card from the folder on the fly; nothing is copied. |
 | **Card CID** | The 16-byte card identification register of your card, as 32 hex digits. The unit's map database is bound to the card it was written to: without that card's CID the unit runs but its map stays blank (Linux shows it in `/sys/block/mmcblk0/device/cid` for a card in a built-in reader; most USB readers do not expose it). |
-| **HLE profile** *(see below)* | A small JSON file naming a few entry points in your main program, needed to draw the screen's 2D graphics. |
+| **HLE profile** *(optional, see below)* | A small JSON file naming a few entry points in your main program. Without one, the emulator finds them itself while the program runs. |
 
 How you read these from your own hardware is up to you and outside the scope of this project; use only what you are
 entitled to. The flash image and controller image are personal to your unit and **must never be committed or shared**.
@@ -94,7 +94,7 @@ Pages with "GitHub Actions" as the source.
 
 ```sh
 cargo build --release
-target/release/w53ga --flash FLASH.bin --rl78 CONTROLLER.bin --sd path/to/SDCard --hle my-profile.json \
+target/release/w53ga --flash FLASH.bin --rl78 CONTROLLER.bin --sd path/to/SDCard \
                      --gps @web/www/routes/tokyo-palace-loop.txt --gps-speed 40 --obd2 --dvr
 ```
 
@@ -117,7 +117,8 @@ Common options (all front ends; `--help` lists them):
 --sd-cid HEX            the card's CID (32 hex digits)
 --rl78-spi FILE         the controller's serial flash contents (default: an empty, provisioned chip)
 --power-on-state FILE   SH7269 power-on reset state (when the build has none built in)
---hle FILE|none         HLE profile (default: a built-in profile whose checks match the flash image, if any)
+--hle FILE|none         HLE profile (default: a built-in profile whose checks match the flash image, else
+                        entry points detected at run time; none: no HLE)
 --obd2 / --dvr          plug in the OBD-II adapter / the drive recorder and its camera
 --wifi [SSID[:PASS]]    fit the Wi-Fi module with one virtual access point bridged to this computer's network
 --gps ROUTE             drive the GNSS receiver along "lat,lon;lat,lon;..." or @FILE; --gps-speed KMH
@@ -139,7 +140,7 @@ cleanly or if more than 20 files would be deleted). Work on a copy of your card'
 | **NOR flash** | x16 parallel NOR command interface: unlock cycles, word and write-buffer programming, sector erase, reset, PPB/DYB protection command sets. Software updates that reprogram the flash work, and the result can be saved (`--save-flash`). |
 | **VDC4 display controller** | Four graphics layers with all formats (RGB565/888, ARGB1555/4444/8888, CLUT8/4/1, YCbCr422), colour tables, chroma-key, alpha blending and rectangle fades, frame-buffer switching, shadow/active register latching on Vsync, panel timing and the VDC interrupts. The 400 × 240 panel is scanned in portrait and shown in landscape. |
 | **Video input** | Video decoder sync (free-running without a camera, NTSC field rate with one), scaler-0 write-back of the camera picture into memory, the video plane. |
-| **2D graphics** | The vector graphics processor runs undocumented microcode and is not emulated; its start-up handshake is. Drawing through the Renesas RGAH 2D API is rendered in software when an [HLE profile](#hle-profiles) names the API's entry points. |
+| **2D graphics** | The vector graphics processor runs undocumented microcode and is not emulated; its start-up handshake is. Drawing through the Renesas RGAH 2D API is rendered in software at the API's entry points, which are [detected at run time or named by a profile](#hle-profiles). |
 | **JCU** | JPEG codec unit, decompression path: commands, interrupts, count mode and line-chunked output. |
 | **SDHI 0** | SD host interface with an SDHC card: initialisation, CMD17/18/24/25, DMA, interrupts; the card is a FAT32 volume synthesised from a folder, with writes kept in an overlay and optionally written back. |
 | **SDHI 1** | Second SD host, SDIO: CMD5/3/7/52/53 for the Wi-Fi module. |
@@ -185,7 +186,7 @@ Measured with the unit's own software on the development machine.
 |---|---|
 | Boot | Power-on reset → boot loader → startup screens → map in about 45 s of emulated time, with the real controller program; no scripted messages or forced state. |
 | Speed | Depends on what the unit is doing. Natively: about 1.2× real time while booting, about 0.5× while driving through the dense map of central Tokyo (the unit's map drawing is CPU-heavy). The browser runs at roughly half the native speed. Both front ends pace to real time when they can. |
-| Display | All layer formats, blending, fades, the video plane; the unit's map, menus, standby screens and camera screens render. Needs an HLE profile for the 2D drawing. |
+| Display | All layer formats, blending, fades, the video plane; the unit's map, menus, standby screens and camera screens render. 2D drawing through [HLE](#hle-profiles). |
 | Controller | The real controller program runs: link handshake, mode changes, settings, GPS handling, warning database in its serial flash. |
 | GPS | The map follows the emulated receiver; routes, manual driving, map clicks. |
 | SD card | Read/write FAT32 card from a folder (native: write-back on exit; browser: write-back on request with a read/write folder). |
@@ -230,7 +231,35 @@ The SH7269's 2D vector graphics processor executes undocumented microcode, so th
 draw through Renesas' RGAH API (`fillRect`, `drawImage`, `bitBlt`, `bitBltFixedColor`, `finish`), and the emulator can
 perform those calls in software instead, when it knows where they are in the loaded program. It can also skip the CPU
 through an RTOS idle loop while nothing is pending, which speeds it up considerably. Both need addresses that belong to a
-particular program, so they come from an **HLE profile** (`src/hle.rs`) rather than from the emulator:
+particular program. The emulator finds them **at run time** by default; an **HLE profile** can also name them.
+
+### Runtime detection
+
+With no profile, the emulator watches the program (`src/detect.rs`); it contains nothing about any particular program,
+no addresses, code bytes or hashes, and finds the entry points wherever the program keeps them:
+
+- **Drawing calls.** The CPU keeps a shadow call stack while detecting. When a call's arguments read as one of the RGAH
+  drawing calls (bitmap descriptors with a valid format, clip area and pixels, points, rectangles, matrices, effect
+  records), that call is explored ahead: the CPU runs on alone, time and devices held, until the program touches the
+  graphics core's registers. The innermost frame whose arguments match exactly one drawing call is that call's entry
+  point, and the frames down to the hardware delimit the library's code. The exploration goes on until `finish` shows
+  itself (the outermost library call, from outside the library, with no drawing arguments, whose first access writes the
+  register the drawing call wrote first). Then the CPU and RAM are put back as they were and the program continues with
+  the hooks in place, so even the first call is drawn and the run is the same as with a profile. Later drawing calls
+  into the library are recognised on entry, before any of their code runs.
+- **Idle loop.** A loop taken many times over (same branch, same stack) is checked instruction by instruction: with
+  interrupts enabled, no interrupt and no device access, consecutive iterations must pass through identical CPU states,
+  so the loop can only be left by an interrupt and skipping it changes nothing. Three such idle periods are required.
+- **Safeguards.** Ambiguous matches identify nothing (and say so); a new hook is checked on its first calls and withdrawn
+  if one does not match its call's layout; a call that is never made is never hooked (it needs no hook).
+
+Detection reports what it finds (`[hle]` lines; `w53ga-headless` prints a summary) and is kept in saved states. Once the
+library, `finish` and the idle loop are known, it costs next to nothing. `W53GA_DETECT_DEBUG=1` describes what it sees.
+
+### Profiles
+
+A profile names the entry points instead; it takes precedence over detection (order: `--hle FILE` or the page's profile
+picker, else a built-in profile whose checks match, else detection; `--hle none` turns HLE off):
 
 ```json
 { "name": "my-unit",
@@ -244,8 +273,8 @@ was made for and contains no code. `w53ga-headless --flash FLASH.bin --make-prof
 --rgah A,B,C,D,E` writes one from addresses you know. Use it with `--hle out.json` or the page's profile picker; profiles
 placed in `profiles/` before building are built in and chosen automatically when their checks match.
 
-**Without a profile** the unit still runs, but nothing drawn through the RGAH API appears (with the unit's software most
-screens stay dark), and it runs more slowly. This repository ships no profile.
+**With HLE off** (`--hle none`) the unit still runs, but nothing drawn through the RGAH API appears and it runs more
+slowly. This repository ships no profile.
 
 ## Power-on state
 
@@ -266,6 +295,10 @@ program counter or stack pointer: the emulator reads those from the flash image'
 - The SCIF transmit-FIFO-empty flag also clears when the CPU fills the FIFO above the trigger level, which avoids an
   interrupt storm with software that never acknowledges it; data and timing are unchanged.
 - The JPEG decoder is functional (a standard baseline decoder), not bit-exact with the JCU's arithmetic.
+- Runtime HLE detection relies on the RGAH argument layouts and on the drawing library reaching the graphics core's
+  registers. It finds only the calls a program makes. If exploring the first drawing call ahead is cut short (another
+  device touched first), that call is identified at its real hardware access instead and completed by unwinding it,
+  which shifts timing by a few hundred instructions.
 - The camera picture is synthetic; the inertial sensor reports a stationary, level unit; the supply voltage is fixed.
 - Saved states are tied to the emulator version and contain your flash image and RAM: keep them private.
 
@@ -277,7 +310,7 @@ libxi-dev` on Debian/Ubuntu).
 
 ```sh
 cargo build --release                 # native binaries in target/release
-cargo test                            # CPU cores, codecs, SD card synthesis and write-back, profiles; no unit files needed
+cargo test                            # CPU cores, codecs, SD card synthesis and write-back, profiles, HLE detection; no unit files needed
 rustup target add wasm32-unknown-unknown
 sh scripts/build-web.sh               # browser build (scripts\build-web.bat on Windows; scripts/run-web.* also serve it)
 ```

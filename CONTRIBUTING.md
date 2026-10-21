@@ -10,7 +10,8 @@ This project emulates **hardware**. It must never contain software or data from 
 - no flash dumps, controller images, update packages, SD card contents, saved states (`.state` files contain the flash
   image and RAM), map, sound, font or graphics data, and no byte arrays, tables or strings copied out of them;
 - no code that recognises or patches a particular program by its bytes, and no symbol files for it. Program-specific
-  entry points belong in user-supplied HLE profiles (`src/hle.rs`), which hold addresses and SHA-256 checks only;
+  entry points belong in user-supplied HLE profiles (`src/hle.rs`), which hold addresses and SHA-256 checks only, or are
+  found at run time from the program's behaviour (`src/detect.rs`), never from its bytes;
 - no personal data: Wi-Fi names and keys, card IDs, MAC addresses, home locations, API keys.
 
 Pull requests that add any of these will be closed. When in doubt, ask in an issue first. Screenshots of what a unit

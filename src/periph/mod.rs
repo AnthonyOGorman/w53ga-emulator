@@ -135,6 +135,9 @@ pub struct Board {
     /// Graphics core start-up model (only the RGAH initialisation talks to it; not kept in saved states).
     #[serde(skip)]
     pub gpu: rgpvg::Rgpvg,
+    /// MMIO accesses by the CPU (all devices), for runtime HLE detection (`crate::detect`).
+    #[serde(skip)]
+    pub mmio_accesses: u64,
     /// Watchdog (only the boot loader starts it, to restart the unit after an update).
     #[serde(skip, default = "wdt::Wdt::power_on")]
     pub wdt: wdt::Wdt,
@@ -220,7 +223,7 @@ impl Board {
             src: { let mut s = Src::new(); if let Some(r) = &c.src { let _ = s.write(audio::SRC_BASE + 8, 2, r.input_control as u64); let _ = s.write(audio::SRC_BASE + 0xA, 2, r.output_control as u64); } s },
             ssi: Some(c.ssi.as_ref().map_or_else(|| Ssi::new(0, 0, 0, false), |t| Ssi::new(t.cr as u32, t.fcr as u32, t.clock.fifo.len(), t.clock.ten))),
             sdhi: None, sdhi1: SdhiEmpty::new(c.sdhi1.as_ref()), peer: subcpu::Peer::new(1), companion: None,
-            fault: None, observed: reset_register_file(), nor: nor::Nor::default(), irq_dirty: true, cached_request: None, rspi: [vec![0; 0x30], vec![0; 0x30]], rspi_tx: [Vec::new(), Vec::new()], obd2: None, dvr: None, camera: false, cam: Default::default(), vdec_free_run: false, gpu: Default::default(), wdt: wdt::Wdt::power_on() })
+            fault: None, observed: reset_register_file(), nor: nor::Nor::default(), irq_dirty: true, cached_request: None, rspi: [vec![0; 0x30], vec![0; 0x30]], rspi_tx: [Vec::new(), Vec::new()], obd2: None, dvr: None, camera: false, cam: Default::default(), vdec_free_run: false, gpu: Default::default(), mmio_accesses: 0, wdt: wdt::Wdt::power_on() })
     }
 
     /// Chip reset of the SH7269 (watchdog overflow): every on-chip peripheral returns to its power-on state (`c`, the

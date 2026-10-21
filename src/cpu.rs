@@ -85,6 +85,9 @@ pub struct Cpu {
     /// LDBANK/STBANK with a selector naming no bank entry (see `exec` 0xE1/0xE5).
     #[serde(skip)]
     pub bank_anomalies: u64,
+    /// Call/return/branch observer for runtime HLE detection (`crate::detect`); None when not detecting.
+    #[serde(skip)]
+    pub trace: Option<Box<crate::detect::Trace>>,
 }
 
 #[inline]
@@ -99,13 +102,36 @@ impl Cpu {
         Cpu {
             r: [0; 16], sr: 0xF0, gbr: 0, vbr: 0, mach: 0, macl: 0, pr: 0, pc: 0, tbr: 0,
             fpscr: 0x0004_0001, fpul: 0, fr: [0; 16], banks: [Bank::default(); 15], mem,
-            float_mode: FloatMode::Hardware, sleeping: false, cur_pc: 0, watch: None, watch_log: Vec::new(), bank_anomalies: 0,
+            float_mode: FloatMode::Hardware, sleeping: false, cur_pc: 0, watch: None, watch_log: Vec::new(), bank_anomalies: 0, trace: None,
         }
     }
 
     #[inline] pub fn t(&self) -> bool { self.sr & SR_T != 0 }
     #[inline] pub fn set_t(&mut self, t: bool) { if t { self.sr |= SR_T } else { self.sr &= !SR_T } }
     #[inline] pub fn imask(&self) -> u32 { (self.sr >> 4) & 15 }
+
+    /// A call has reached its callee (the delay slot, if any, executed): tell the detection trace, if any.
+    #[inline(always)]
+    fn traced_call(&mut self) { if self.trace.is_some() { self.trace_call(); } }
+    #[inline(always)]
+    fn traced_ret(&mut self) { if self.trace.is_some() { self.trace_ret(); } }
+    /// A taken branch from `from`: backward ones are loop candidates.
+    #[inline(always)]
+    fn traced_branch(&mut self, from: u32) { if self.trace.is_some() && self.pc < from { self.trace_back(); } }
+
+    #[cold]
+    #[inline(never)]
+    fn trace_call(&mut self) {
+        if let Some(t) = self.trace.as_deref_mut() {
+            t.call(&crate::detect::CallRegs { r: &self.r, fr: &self.fr, pc: self.pc, pr: self.pr, sr: self.sr, gbr: self.gbr, mach: self.mach, macl: self.macl, fpscr: self.fpscr }, &self.mem);
+        }
+    }
+    #[cold]
+    #[inline(never)]
+    fn trace_ret(&mut self) { if let Some(t) = self.trace.as_deref_mut() { t.ret(self.pc, self.r[15]); } }
+    #[cold]
+    #[inline(never)]
+    fn trace_back(&mut self) { if let Some(t) = self.trace.as_deref_mut() { t.back(self.pc, self.r[15]); } }
 
     // ---------- memory ----------
     #[inline]
@@ -161,7 +187,9 @@ impl Cpu {
         self.r[15] = sp.wrapping_sub(8);
         self.sr = (self.sr & !0xF0) | ((level & 15) << 4);
         let va = self.vbr.wrapping_add(vector * 4);
+        let ret = self.pc;
         self.pc = self.r32(io, va)?;
+        if let Some(t) = self.trace.as_deref_mut() { t.interrupt(self.pc, ret, sp); }
         self.sleeping = false;
         Ok(())
     }
@@ -172,6 +200,7 @@ impl Cpu {
         self.w32(io, sp.wrapping_sub(8), return_pc)?;
         self.r[15] = sp.wrapping_sub(8);
         self.pc = self.r32(io, self.vbr.wrapping_add(vector * 4))?;
+        if let Some(t) = self.trace.as_deref_mut() { t.interrupt(self.pc, return_pc, sp); }
         Ok(())
     }
 
@@ -227,11 +256,15 @@ impl Cpu {
                     0 => { // BSRF Rn
                         let t = next.wrapping_add(2).wrapping_add(self.r[n]);
                         self.pr = pc.wrapping_add(4);
-                        return self.branch_delayed(io, pc, t, in_slot, op);
+                        self.branch_delayed(io, pc, t, in_slot, op)?;
+                        self.traced_call();
+                        return Ok(());
                     }
                     2 => { // BRAF Rn
                         let t = next.wrapping_add(2).wrapping_add(self.r[n]);
-                        return self.branch_delayed(io, pc, t, in_slot, op);
+                        self.branch_delayed(io, pc, t, in_slot, op)?;
+                        self.traced_branch(pc);
+                        return Ok(());
                     }
                     8 => {} // PREF @Rn (no cache model)
                     _ => return Err(illegal),
@@ -266,7 +299,7 @@ impl Cpu {
                     _ => return Err(illegal),
                 },
                 0xB => match op {
-                    0x000B => { let t = self.pr; return self.branch_delayed(io, pc, t, in_slot, op); } // RTS
+                    0x000B => { let t = self.pr; self.branch_delayed(io, pc, t, in_slot, op)?; self.traced_ret(); return Ok(()); } // RTS
                     0x001B => { self.sleeping = true; } // SLEEP
                     0x002B => { // RTE
                         if in_slot { return Err(Fault::IllegalSlot { pc, op }); }
@@ -277,10 +310,11 @@ impl Cpu {
                         self.sr = sr & SR_MASK;
                         self.slot(io, next)?;
                         self.pc = t;
+                        if let Some(tr) = self.trace.as_deref_mut() { tr.rte(self.pc, self.r[15]); }
                     }
                     0x005B => { no_slot(in_slot)?; self.resbank(io)?; } // RESBANK
-                    0x006B => { no_slot(in_slot)?; self.pc = self.pr; } // RTS/N
-                    _ if op & 0xF0FF == 0x007B => { no_slot(in_slot)?; self.r[0] = self.r[n]; self.pc = self.pr; } // RTV/N
+                    0x006B => { no_slot(in_slot)?; self.pc = self.pr; self.traced_ret(); } // RTS/N
+                    _ if op & 0xF0FF == 0x007B => { no_slot(in_slot)?; self.r[0] = self.r[n]; self.pc = self.pr; self.traced_ret(); } // RTV/N
                     _ => return Err(illegal),
                 },
                 0xC => { let a = self.r[m].wrapping_add(self.r[0]); self.r[n] = sext8(self.r8(io, a)?); }
@@ -377,6 +411,7 @@ impl Cpu {
                     let a = self.tbr.wrapping_add((op & 0xFF) * 4);
                     let t = self.r32(io, a)?;
                     self.pr = next; self.pc = t;
+                    self.traced_call();
                 }
                 0x6 => { // BCLR/BSET #imm3,Rn
                     let rn = ((op >> 4) & 15) as usize; let bit = 1 << (op & 7);
@@ -389,7 +424,7 @@ impl Cpu {
                 0x8 => { let t = self.r[0] == sext8(op); self.set_t(t); }
                 0x9 | 0xB => { // BT / BF
                     no_slot(in_slot)?;
-                    if self.t() == (n == 0x9) { self.pc = next.wrapping_add(2).wrapping_add(sext8(op) << 1); }
+                    if self.t() == (n == 0x9) { self.pc = next.wrapping_add(2).wrapping_add(sext8(op) << 1); self.traced_branch(pc); }
                 }
                 0xD | 0xF => { // BT/S / BF/S
                     if in_slot { return Err(Fault::IllegalSlot { pc, op }); }
@@ -397,12 +432,13 @@ impl Cpu {
                     let t = if taken { next.wrapping_add(2).wrapping_add(sext8(op) << 1) } else { pc.wrapping_add(4) };
                     self.slot(io, next)?;
                     self.pc = t;
+                    if taken { self.traced_branch(pc); }
                 }
                 _ => return Err(illegal),
             },
             0x9 => { let a = next.wrapping_add(2).wrapping_add((op & 0xFF) * 2); self.r[n] = sext16(self.r16(io, a)?); }
-            0xA => { let t = next.wrapping_add(2).wrapping_add(sext12(op) << 1); return self.branch_delayed(io, pc, t, in_slot, op); }
-            0xB => { let t = next.wrapping_add(2).wrapping_add(sext12(op) << 1); self.pr = pc.wrapping_add(4); return self.branch_delayed(io, pc, t, in_slot, op); }
+            0xA => { let t = next.wrapping_add(2).wrapping_add(sext12(op) << 1); self.branch_delayed(io, pc, t, in_slot, op)?; self.traced_branch(pc); return Ok(()); }
+            0xB => { let t = next.wrapping_add(2).wrapping_add(sext12(op) << 1); self.pr = pc.wrapping_add(4); self.branch_delayed(io, pc, t, in_slot, op)?; self.traced_call(); return Ok(()); }
             0xC => {
                 let d = op & 0xFF;
                 match n {
@@ -455,7 +491,7 @@ impl Cpu {
             0x08 => self.r[n] <<= 2,
             0x09 => self.r[n] >>= 2,
             0x0A => self.mach = self.r[n],
-            0x0B => { let t = self.r[n]; self.pr = pc.wrapping_add(4); return self.branch_delayed(io, pc, t, in_slot, op); } // JSR
+            0x0B => { let t = self.r[n]; self.pr = pc.wrapping_add(4); self.branch_delayed(io, pc, t, in_slot, op)?; self.traced_call(); return Ok(()); } // JSR
             0x0E => self.sr = self.r[n] & SR_MASK,
             0x10 => { self.r[n] = self.r[n].wrapping_sub(1); let t = self.r[n] == 0; self.set_t(t); }
             0x11 => { let t = self.r[n] as i32 >= 0; self.set_t(t); }
@@ -483,7 +519,7 @@ impl Cpu {
             0x2B => { let t = self.r[n]; return self.branch_delayed(io, pc, t, in_slot, op); } // JMP
             0x2E => self.vbr = self.r[n],
             0x4A => self.tbr = self.r[n],
-            0x4B => { if in_slot { return Err(Fault::IllegalSlot { pc, op }); } self.pr = next; self.pc = self.r[n]; } // JSR/N
+            0x4B => { if in_slot { return Err(Fault::IllegalSlot { pc, op }); } self.pr = next; self.pc = self.r[n]; self.traced_call(); } // JSR/N
             0x52 => { let a = self.r[n].wrapping_sub(4); self.w32(io, a, self.fpul)?; self.r[n] = a; }
             0x56 => { let a = self.r[n]; self.fpul = self.r32(io, a)?; self.r[n] = a.wrapping_add(4); }
             0x5A => self.fpul = self.r[n],

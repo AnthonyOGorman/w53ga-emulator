@@ -11,6 +11,7 @@ use crate::periph::Board;
 impl Mmio for Board {
     fn read(&mut self, pc: u32, a: u32, n: usize) -> u64 {
         self.irq_dirty = true;
+        self.mmio_accesses += 1;
         if crate::periph::nor::Nor::handles(a) {
             if let Some(v) = self.nor.mode_read(a) { return match n { 4 => ((v as u64) << 16) | v as u64, 1 => (v & 0xFF) as u64, _ => v as u64 }; }
         }
@@ -23,6 +24,7 @@ impl Mmio for Board {
     }
     fn write(&mut self, pc: u32, a: u32, n: usize, v: u64) {
         self.irq_dirty = true;
+        self.mmio_accesses += 1;
         if !Board::write(self, a, n, v) {
             // Unmodelled register: the store is accepted and remembered, nothing else happens.
             if self.observed.insert((a, n), v).is_none() { eprintln!("[mmio] unmodelled write {a:08x}/{n} = {v:x} at pc {pc:08x} (observed)"); }
@@ -39,6 +41,8 @@ fn false64() -> [bool; 64] { [false; 64] }
 
 /// Header of saved states; bump when the serialized layout changes.
 pub const STATE_MAGIC: &[u8; 16] = b"W53GA-STATE-0001";
+/// Optional trailer of a saved state: the results of runtime HLE detection (`crate::detect::Found`).
+pub const DETECT_MAGIC: &[u8; 16] = b"W53GA-DETECT-001";
 
 #[derive(Debug)]
 pub enum Stop { Cpu(Fault), Model(String) }
@@ -96,13 +100,17 @@ pub struct Machine {
     /// A development hook is set (stop PC, argument log, call counts): `step` checks them (refreshed by `run`).
     #[serde(skip)]
     debug_hooks: bool,
+    /// Runtime detection of the HLE hooks when no profile names them (`crate::detect`); its results are kept in saved
+    /// states (`save_state_to`). While it runs, the CPU carries its trace (`Cpu::trace`).
+    #[serde(skip)]
+    pub detect: Option<Box<crate::detect::Detector>>,
 }
 
 impl Machine {
     pub fn from_checkpoint(flash: Vec<u8>, c: &Checkpoint) -> Result<Machine, String> {
         let mut cpu = Cpu::new(Memory::new(flash));
         c.apply(&mut cpu);
-        Ok(Machine { cpu, board: Board::from_checkpoint(c)?, steps: c.steps, interrupts: 0, history: [0; 64], hist_irq: [false; 64], hist_pos: 0, cpu_per_p0: 1, sub: 0, p0_batch: 1, call_counts: None, gfx_hle: false, gfx: Default::default(), hooks: Default::default(), idle_skip: false, idle_skipped: 0, irq_hist: Default::default(), stop_pc: std::env::var("AR_SH_STOP_PC").ok().and_then(|v| u32::from_str_radix(&v, 16).ok()), resets: 0, arg_log: arg_log_env(), debug_hooks: false })
+        Ok(Machine { cpu, board: Board::from_checkpoint(c)?, steps: c.steps, interrupts: 0, history: [0; 64], hist_irq: [false; 64], hist_pos: 0, cpu_per_p0: 1, sub: 0, p0_batch: 1, call_counts: None, gfx_hle: false, gfx: Default::default(), hooks: Default::default(), idle_skip: false, idle_skipped: 0, irq_hist: Default::default(), stop_pc: std::env::var("AR_SH_STOP_PC").ok().and_then(|v| u32::from_str_radix(&v, 16).ok()), resets: 0, arg_log: arg_log_env(), debug_hooks: false, detect: None })
     }
 
     /// The unit as power is applied: the chip's power-on reset state (`Checkpoint::power_on`), the flash image as
@@ -118,11 +126,31 @@ impl Machine {
         Ok(m)
     }
 
-    /// Use an HLE profile (or none): its hooks replace the current ones. The profile should have been verified against
-    /// the flash image (`Profile::verify`).
+    /// Use an HLE profile: its hooks replace the current ones and runtime detection is off. The profile should have
+    /// been verified against the flash image (`Profile::verify`). Without one (None) the hooks are detected at run time
+    /// (`crate::detect`), continuing from what an earlier detection (for example in a loaded state) found. Callers choose
+    /// in this order: an explicit profile, else a matching built-in one, else detection.
     pub fn set_profile(&mut self, p: Option<&crate::hle::Profile>) {
-        self.hooks = p.map(|p| p.hooks()).unwrap_or_default();
+        match p {
+            Some(p) => { self.hooks = p.hooks(); self.detect = None; self.cpu.trace = None; }
+            None => {
+                let d = self.detect.take().unwrap_or_default();
+                self.hooks = d.hooks();
+                self.cpu.trace = Some(Box::new(d.trace()));
+                self.detect = Some(d);
+            }
+        }
     }
+
+    /// No HLE at all: no profile and no runtime detection (2D graphics calls are not rendered, no idle skipping).
+    pub fn disable_hle(&mut self) {
+        self.hooks = Default::default();
+        self.detect = None;
+        self.cpu.trace = None;
+    }
+
+    /// What runtime detection has found so far (None when a profile is in use or HLE is off).
+    pub fn detected(&self) -> Option<&crate::detect::Found> { self.detect.as_ref().map(|d| &d.found) }
 
     /// Typical settings for real-time use: about 6 SH-2A instructions per peripheral clock (the 266 MHz core), 32-clock
     /// peripheral batches, idle skipping and software 2D graphics where the profile allows, and the free-running video
@@ -178,7 +206,9 @@ impl Machine {
         }
         if self.debug_hooks { if let Some((lo, hi, m)) = &mut self.call_counts { let pc = self.cpu.pc; if pc >= *lo && pc <= *hi { if let Some(c) = m.get_mut(&pc) { *c += 1; } } } }
         crate::prof::set(crate::prof::CPU);
+        let pc0 = self.cpu.pc;
         self.cpu.step(&mut self.board).map_err(Stop::Cpu)?;
+        if self.cpu.trace.is_some() { self.detect_check(pc0); }
         if self.cpu_per_p0 > 1 { self.board.flush_deferred(&mut self.cpu.mem); }
         self.sub += 1;
         if self.sub < self.cpu_per_p0 * self.p0_batch { return Ok(()); }
@@ -228,11 +258,26 @@ impl Machine {
     /// Intercept an RGAH entry point: render in software, return 0 (RGAH_OK) to the caller. False if `pc` is not one.
     #[inline]
     fn gfx_call(&mut self) -> bool {
-        use crate::gfx::*;
-        use crate::hle::RgahFn;
         let Some(f) = self.hooks.rgah_at(self.cpu.pc) else { return false };
         let r = [self.cpu.r[4], self.cpu.r[5], self.cpu.r[6], self.cpu.r[7]];
-        let mut call = Call { mem: &mut self.cpu.mem, r, sp: self.cpu.r[15] };
+        if let Some(d) = self.detect.as_deref_mut() {
+            if !d.probation.is_empty() && !d.probe(self.cpu.trace.as_deref_mut(), &self.cpu.mem, self.cpu.pc, r, self.cpu.r[15], self.steps) {
+                self.hooks = d.hooks();
+                return false;
+            }
+        }
+        self.render_call(f, r, self.cpu.r[15]);
+        self.cpu.r[0] = 0;
+        self.cpu.pc = self.cpu.pr;
+        if let Some(t) = self.cpu.trace.as_deref_mut() { t.ret(self.cpu.pc, self.cpu.r[15]); }
+        true
+    }
+
+    /// Render one RGAH call in software from its arguments (R4..R7 and the stack at `sp`).
+    fn render_call(&mut self, f: crate::hle::RgahFn, r: [u32; 4], sp: u32) {
+        use crate::gfx::*;
+        use crate::hle::RgahFn;
+        let mut call = Call { mem: &mut self.cpu.mem, r, sp };
         let ok = match f {
             RgahFn::FillRect => fill_rect(&mut call, &mut self.gfx),
             RgahFn::DrawImage => draw_image(&mut call, &mut self.gfx),
@@ -241,13 +286,126 @@ impl Machine {
             RgahFn::Finish => Some(()),
         };
         if ok.is_none() && self.gfx.warned.len() < 20 {
-            let msg = format!("RGAH_{} not rendered (args {:08x?}, sp {:08x})", f.name(), r, self.cpu.r[15]);
+            let msg = format!("RGAH_{} not rendered (args {:08x?}, sp {:08x})", f.name(), r, sp);
             eprintln!("[gfx] {msg}");
             self.gfx.warned.push(msg);
         }
-        self.cpu.r[0] = 0;
-        self.cpu.pc = self.cpu.pr;
-        true
+    }
+
+    /// After an instruction while runtime detection runs (`pc0`: where it executed): cheap checks, then the detector
+    /// when the graphics core was accessed, the trace flagged something or an idle loop is being verified.
+    #[inline]
+    fn detect_check(&mut self, pc0: u32) {
+        let Some(d) = self.detect.as_deref() else { return };
+        let flagged = self.cpu.trace.as_ref().is_some_and(|t| t.event);
+        if flagged || self.board.gpu.accesses != d.gpu_seen || d.verify.is_some() { self.detect_event(pc0); }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn detect_event(&mut self, pc0: u32) {
+        use crate::detect::Action;
+        let (Some(mut d), Some(mut t)) = (self.detect.take(), self.cpu.trace.take()) else { return };
+        t.event = false;
+        let mut changed = false;
+        if self.board.gpu.accesses != d.gpu_seen {
+            d.gpu_seen = self.board.gpu.accesses;
+            let (a, w) = self.board.gpu.last;
+            if let Some(Action::Unwind { index, f }) = d.on_gpu(&mut t, &self.cpu.mem, (a, w), self.steps, false) {
+                let fr = t.frames[index];
+                t.frames.truncate(index);
+                self.unwind_and_render(&fr, f);
+                changed = true;
+            }
+        }
+        if t.entry_event {
+            t.entry_event = false;
+            changed |= d.on_entry(&mut t, &self.cpu.mem, self.steps);
+            if t.light { t.frames.clear(); }
+        }
+        if t.cand_event {
+            t.cand_event = false;
+            if let Some(entry) = d.candidate(&t, &self.cpu.mem) {
+                let before = d.found.rgah;
+                self.speculate(&mut d, &t);
+                if d.found.rgah == before { d.spec_rejected.push(entry); }
+                d.sync(&mut t);
+                changed = true;
+            }
+        }
+        if let Some((to, sp)) = t.loop_event.take() {
+            if d.verify.is_none() && d.found.idle_loop.is_none() { d.start_verify(to, sp); }
+        }
+        if d.verify.is_some() {
+            let op = self.cpu.mem.fetch16(pc0).unwrap_or(0);
+            d.verify_step(&mut t, &self.cpu, pc0, op, self.board.mmio_accesses, self.interrupts, self.steps);
+            changed |= d.found.idle_loop.is_some() && self.hooks.idle_loop.is_none();
+        }
+        if changed { self.hooks = d.hooks(); d.sync(&mut t); }
+        self.cpu.trace = Some(t);
+        self.detect = Some(d);
+    }
+
+    /// Explore the call the CPU has just entered (it looks like a drawing call) ahead of time, without letting it affect
+    /// the machine: the CPU runs on alone, with time and interrupts held, until it reaches the graphics core and then
+    /// `finish`, or returns, or would touch any other device, or a budget runs out. The detector watches as usual. Then
+    /// the CPU registers and RAM are put back exactly as they were, so the program goes on from the same point with
+    /// whatever hooks were found, as if they had been there from the start.
+    fn speculate(&mut self, d: &mut crate::detect::Detector, t: &crate::detect::Trace) {
+        use crate::detect::Action;
+        use crate::hle::RgahFn;
+        let regs = CpuRegs::save(&self.cpu);
+        let (sdram, oram) = (self.cpu.mem.sdram.clone(), self.cpu.mem.oram.clone());
+        let depth = t.frames.len();
+        let start = d.found.rgah;
+        let mut io = SpecIo { board: &self.board, gpu: self.board.gpu.clone(), blocked: None };
+        let mut seen = io.gpu.accesses;
+        self.cpu.trace = Some(Box::new(t.clone()));
+        let mut why = "budget";
+        let mut n = 0;
+        while n < SPEC_BUDGET {
+            n += 1;
+            if self.cpu.step(&mut io).is_err() { why = "fault"; break; }
+            if io.blocked.is_some() { why = "device access"; break; }
+            if self.cpu.sleeping { why = "sleep"; break; }
+            let Some(tr) = self.cpu.trace.as_deref_mut() else { break };
+            tr.event = false;
+            tr.cand_event = false;
+            tr.loop_event = None;
+            if tr.entry_event { tr.entry_event = false; d.on_entry(tr, &self.cpu.mem, self.steps); }
+            if io.gpu.accesses != seen {
+                seen = io.gpu.accesses;
+                if let Some(Action::Unwind { f: RgahFn::Finish, .. }) = d.on_gpu(tr, &self.cpu.mem, io.gpu.last, self.steps, true) { why = "finish found"; break; }
+            }
+            if tr.frames.len() < depth && d.found.rgah == start { why = "returned"; break; }
+        }
+        if crate::detect::debug() {
+            eprintln!("[detect] explored {:x} for {n} instructions: stopped by {why}{}", regs.pc, io.blocked.map_or(String::new(), |a| format!(" ({a:08x})")));
+        }
+        regs.restore(&mut self.cpu);
+        self.cpu.mem.sdram.copy_from_slice(&sdram);
+        self.cpu.mem.oram.copy_from_slice(&oram);
+        self.cpu.trace = None;
+    }
+
+    /// Complete a call identified while it was running: return to its caller with the callee-saved registers it was
+    /// entered with (and its stack arguments as they were), rendering it in software from its entry arguments, with
+    /// RGAH_OK as the result.
+    fn unwind_and_render(&mut self, fr: &crate::detect::Frame, f: crate::hle::RgahFn) {
+        let c = &mut self.cpu;
+        c.r[8..15].copy_from_slice(&fr.saved);
+        c.r[15] = fr.sp;
+        (c.mach, c.macl, c.gbr, c.sr, c.fpscr) = (fr.mach, fr.macl, fr.gbr, fr.sr, fr.fpscr);
+        c.fr[12..16].copy_from_slice(&fr.fr);
+        for (k, w) in fr.stk.iter().enumerate() {
+            let a = fr.sp.wrapping_add(4 * k as u32);
+            if c.mem.read_plain(a, 4).is_some() { c.mem.write_plain(a, 4, *w as u64); }
+        }
+        if f != crate::hle::RgahFn::Finish { self.render_call(f, fr.args, fr.sp); }
+        let c = &mut self.cpu;
+        c.r[0] = 0;
+        c.pr = fr.ret;
+        c.pc = fr.ret;
     }
 
     /// Save the complete emulator state (both CPUs, all peripheral models, memories) as gzip-compressed bincode.
@@ -261,6 +419,11 @@ impl Machine {
         let mut z = flate2::write::GzEncoder::new(w, flate2::Compression::fast());
         std::io::Write::write_all(&mut z, STATE_MAGIC).map_err(|e| e.to_string())?;
         bincode::serialize_into(&mut z, self).map_err(|e| e.to_string())?;
+        // Runtime HLE detection results follow the machine as an optional trailer (older readers ignore it).
+        if let Some(d) = &self.detect {
+            std::io::Write::write_all(&mut z, DETECT_MAGIC).map_err(|e| e.to_string())?;
+            bincode::serialize_into(&mut z, &d.found).map_err(|e| e.to_string())?;
+        }
         z.finish().map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -277,7 +440,12 @@ impl Machine {
         let mut magic = [0u8; 16];
         std::io::Read::read_exact(&mut z, &mut magic).map_err(|e| e.to_string())?;
         if &magic != STATE_MAGIC { return Err(format!("not a state of this emulator version (header {:?})", String::from_utf8_lossy(&magic))); }
-        let mut m: Machine = bincode::deserialize_from(z).map_err(|e| e.to_string())?;
+        let mut m: Machine = bincode::deserialize_from(&mut z).map_err(|e| e.to_string())?;
+        let mut tag = [0u8; 16];
+        if std::io::Read::read_exact(&mut z, &mut tag).is_ok() && &tag == DETECT_MAGIC {
+            let found: crate::detect::Found = bincode::deserialize_from(&mut z).map_err(|e| e.to_string())?;
+            m.detect = Some(Box::new(crate::detect::Detector::new(found)));
+        }
         m.history = [0; 64]; m.hist_irq = [false; 64];
         m.stop_pc = std::env::var("AR_SH_STOP_PC").ok().and_then(|v| u32::from_str_radix(&v, 16).ok());
         m.arg_log = arg_log_env();
@@ -346,6 +514,42 @@ impl Machine {
             origin: (grc_hs, grc_vs),
         })
     }
+}
+
+/// Instructions a speculative exploration may run (`Machine::speculate`).
+const SPEC_BUDGET: u32 = 400_000;
+
+/// The CPU state saved around a speculative exploration (everything but memory and the detection trace).
+struct CpuRegs { r: [u32; 16], sr: u32, gbr: u32, vbr: u32, mach: u32, macl: u32, pr: u32, pc: u32, tbr: u32, fpscr: u32, fpul: u32, fr: [u32; 16], banks: [crate::cpu::Bank; 15], sleeping: bool, cur_pc: u32, bank_anomalies: u64 }
+
+impl CpuRegs {
+    fn save(c: &Cpu) -> CpuRegs {
+        CpuRegs { r: c.r, sr: c.sr, gbr: c.gbr, vbr: c.vbr, mach: c.mach, macl: c.macl, pr: c.pr, pc: c.pc, tbr: c.tbr, fpscr: c.fpscr, fpul: c.fpul, fr: c.fr, banks: c.banks, sleeping: c.sleeping, cur_pc: c.cur_pc, bank_anomalies: c.bank_anomalies }
+    }
+    fn restore(&self, c: &mut Cpu) {
+        (c.r, c.sr, c.gbr, c.vbr, c.mach, c.macl, c.pr, c.pc, c.tbr) = (self.r, self.sr, self.gbr, self.vbr, self.mach, self.macl, self.pr, self.pc, self.tbr);
+        (c.fpscr, c.fpul, c.fr, c.banks, c.sleeping, c.cur_pc, c.bank_anomalies) = (self.fpscr, self.fpul, self.fr, self.banks, self.sleeping, self.cur_pc, self.bank_anomalies);
+    }
+}
+
+/// The bus seen during a speculative exploration: the graphics core is a private copy of its model; any other device
+/// access is refused (and ends the exploration) so that nothing outside the CPU and RAM can change.
+struct SpecIo<'a> { board: &'a Board, gpu: crate::periph::rgpvg::Rgpvg, blocked: Option<u32> }
+
+impl Mmio for SpecIo<'_> {
+    fn read(&mut self, _pc: u32, a: u32, n: usize) -> u64 {
+        if crate::periph::rgpvg::Rgpvg::handles(a) { return self.gpu.read(a, n).unwrap_or(0); }
+        self.blocked.get_or_insert(a);
+        0
+    }
+    fn write(&mut self, _pc: u32, a: u32, n: usize, v: u64) {
+        if crate::periph::rgpvg::Rgpvg::handles(a) { let _ = self.gpu.write(a, n, v); return; }
+        if (0xF000_0000..0xF200_0000).contains(&a) { return; } // cache arrays: no effect (as `Board::write`)
+        self.blocked.get_or_insert(a);
+    }
+    fn ibnr(&mut self) -> u16 { self.board.latches.value(IBNR) as u16 }
+    fn set_ibnr(&mut self, _v: u16) { self.blocked.get_or_insert(IBNR); }
+    fn flash_cmd_mode(&self) -> bool { self.board.nor.in_command_mode() }
 }
 
 /// One GR layer as the image synthesizer reads it.

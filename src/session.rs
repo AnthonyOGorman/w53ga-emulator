@@ -43,7 +43,8 @@ pub const OPTIONS_HELP: &str = "\
   --sd-cid HEX            the card's CID (32 hex digits), for data bound to a particular card
   --rl78-spi FILE         the controller's serial flash contents (default: empty, provisioned chip)
   --power-on-state FILE   SH7269 power-on reset state (when this build has none built in)
-  --hle FILE|none         HLE profile (default: a built-in profile whose checks match the flash image, if any)
+  --hle FILE|none         HLE profile (default: a built-in profile whose checks match the flash image, else
+                          entry points detected at run time; none: no HLE)
   --obd2                  plug in the OBD-II adapter
   --dvr                   plug in the drive recorder and its camera
   --wifi [SSID[:PASS]]    fit the Wi-Fi module with one virtual access point bridged to this computer's network
@@ -140,9 +141,15 @@ impl Options {
         Ok(())
     }
 
+    /// HLE hooks, in this order: the profile given with --hle, else a built-in profile matching the flash image, else
+    /// runtime detection (`crate::detect`). `--hle none` turns HLE off.
     fn apply_profile(&self, m: &mut Machine) -> Result<(), String> {
         let p = match self.hle.as_deref() {
-            Some("none") => None,
+            Some("none") => {
+                println!("HLE: off (2D graphics calls are not rendered; see README, \"HLE profiles\")");
+                m.disable_hle();
+                return Ok(());
+            }
             Some(path) => {
                 let p = crate::hle::Profile::load(Path::new(path))?;
                 p.verify(&m.cpu.mem.flash)?;
@@ -152,7 +159,7 @@ impl Options {
         };
         match &p {
             Some(p) => println!("HLE profile: {}", p.name),
-            None => println!("HLE profile: none (2D graphics calls are not rendered; see README, \"HLE profiles\")"),
+            None => println!("HLE profile: none; entry points are detected at run time"),
         }
         m.set_profile(p.as_ref());
         Ok(())

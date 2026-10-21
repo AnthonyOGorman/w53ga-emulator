@@ -11,6 +11,7 @@
 pub mod camera;
 pub mod checkpoint;
 pub mod cpu;
+pub mod detect;
 pub mod dvr;
 pub mod embedded;
 pub mod fat32;

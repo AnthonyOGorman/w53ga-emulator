@@ -90,6 +90,12 @@ fn main() {
     println!("ran {done:.2} s of emulated time in {secs:.2} s ({:.2}x real time), {} interrupts", done / secs.max(1e-9), m.interrupts);
     if let Err(e) = &result { println!("STOPPED at t={:.3}s pc {:08x}: {e:?}\n  recent:{}", m.steps as f64 / P0_HZ, m.cpu.pc, m.dump_history()); }
     if m.gfx_hle && m.hooks.rgah_range.is_some() { println!("2D graphics: {} fills, {} images, {} blits, {} masked, {} pixels", m.gfx.fills, m.gfx.images, m.gfx.blits, m.gfx.masks, m.gfx.pixels); }
+    if let Some(f) = m.detected() {
+        let at = |a: Option<u32>, t: u64| a.map_or("not seen".to_string(), |a| format!("{a:#x} (t={:.3}s)", t as f64 / P0_HZ));
+        let names = ["fill_rect", "draw_image", "bit_blt", "bit_blt_fixed_color", "finish"];
+        let rgah: Vec<String> = names.iter().enumerate().map(|(k, n)| format!("{n} {}", at(f.rgah[k], f.rgah_at[k]))).collect();
+        println!("HLE detected at run time: idle_loop {}; {}", at(f.idle_loop, f.idle_at), rgah.join(", "));
+    }
     if let Some(f) = &frame { save_frame(&m, f); }
     w53ga_emu::sdsync::sync_and_report(m.board.sdhi.as_mut().map(|s| &mut s.card));
     if let Some(p) = opt("--save-state") { match m.save_state(Path::new(&p)) { Ok(()) => println!("state saved: {p}"), Err(e) => println!("state not saved: {e}") } }

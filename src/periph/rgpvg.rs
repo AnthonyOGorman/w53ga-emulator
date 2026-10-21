@@ -23,12 +23,17 @@ pub struct Rgpvg {
     pub pending: u32,
     /// Lists submitted (start address written to 0xE810_2000).
     pub submits: u32,
+    /// Register accesses by the CPU and the last one (address, write), for runtime HLE detection (`crate::detect`).
+    pub accesses: u64,
+    pub last: (u32, bool),
 }
 
 impl Rgpvg {
     pub fn handles(a: u32) -> bool { (BASE..END).contains(&a) }
 
-    pub fn read(&self, a: u32, n: usize) -> Result<u64, String> {
+    pub fn read(&mut self, a: u32, n: usize) -> Result<u64, String> {
+        self.accesses += 1;
+        self.last = (a, false);
         if n != 4 || a & 3 != 0 { return Err(format!("graphics core read {a:08x}/{n}")); }
         Ok(match a {
             STATUS => self.pending as u64,
@@ -39,6 +44,8 @@ impl Rgpvg {
 
     pub fn write(&mut self, a: u32, n: usize, v: u64) -> Result<(), String> {
         if n != 4 || a & 3 != 0 { return Err(format!("graphics core write {a:08x}/{n}")); }
+        self.accesses += 1;
+        self.last = (a, true);
         let v = v as u32;
         self.regs.insert(a, v);
         match a {

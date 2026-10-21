@@ -13,7 +13,7 @@ let dir = null;                   // FileSystemDirectoryHandle (read/write folde
 const reader = new FileReaderSync();
 const enc = new TextEncoder(), dec = new TextDecoder();
 let running = false, paused = false, emuMs = 0, wallStart = 0, lastFrame = 0, lastStatus = 0, statusWall = 0, statusEmu = 0, speedFactor = 0;
-let wifi = false, netBusy = false;
+let wifi = false, netBusy = false, netWarned = false;
 const session = Math.floor(Math.random() * 1e12).toString(36);
 
 function put(bytes) { const p = ex.alloc(bytes.length); mem().set(bytes, p); return p; }
@@ -50,8 +50,11 @@ function netPump() {
   const cmds = text();
   netBusy = true;
   fetch('net?session=' + session, { method: 'POST', body: cmds })
-    .then((r) => (r.ok ? r.text() : '')).then((t) => { if (t.length > 2) str(t, ex.emu_net_give); })
-    .catch(() => {}).finally(() => { netBusy = false; });
+    .then((r) => { if (!r.ok) throw new Error(); return r.text(); }).then((t) => { if (t.length > 2) str(t, ex.emu_net_give); })
+    .catch(() => {
+      // No relay (a static host such as GitHub Pages): the module finds no network. Say so once.
+      if (!netWarned) { netWarned = true; postMessage({ type: 'error', message: 'Wi-Fi: no network here. The emulated Wi-Fi needs the local server w53ga-serve (see README, "Quick start: in the browser"); everything else works.' }); }
+    }).finally(() => { netBusy = false; });
 }
 
 function loop() {

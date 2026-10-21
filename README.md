@@ -11,6 +11,10 @@ through WebAssembly.
   <img src="docs/screenshots/web-driving.png" alt="The browser front end running the unit's map while driving a route" width="900">
 </p>
 
+**Try it in your browser: <https://anthonyogorman.github.io/w53ga-emulator/>**. The page runs entirely on your
+computer: your files are read by your browser and never uploaded. Only the emulated Wi-Fi needs the local server
+(see [Quick start: in the browser](#quick-start-in-the-browser)).
+
 > **This project contains no CellStar code, firmware or data.** It emulates the hardware only. To run anything you
 > must supply a dump of **your own unit's** flash memory and controller, and a copy of **your own SD card**. Nothing of
 > the kind is included in this repository, and please do not share yours: the software on them belongs to its owners.
@@ -54,7 +58,7 @@ The `.gitignore` blocks the usual file types, but take care.
 
 Everything runs locally in the page: the emulator is WebAssembly in a Web Worker, your files are read by the browser
 from your disk, and **nothing is uploaded anywhere**. The page is static, so any static file server works, including
-GitHub Pages.
+GitHub Pages (the hosted copy is at <https://anthonyogorman.github.io/w53ga-emulator/>).
 
 ```sh
 rustup target add wasm32-unknown-unknown       # once
@@ -86,8 +90,8 @@ tiles from openstreetmap.org, and only when you open it). **Screenshot** saves a
 machine (it contains your flash image and RAM, so keep it private).
 
 The emulated Wi-Fi module needs `w53ga-serve`: browsers cannot open raw sockets, so the page hands the module's
-connections to the local server, which makes them with this computer's network. On a purely static host the module
-simply finds no network.
+connections to the local server, which makes them with this computer's network. On a purely static host such as GitHub Pages
+the module finds no network (the page says so); everything else works.
 
 To publish the page on GitHub Pages, run the *Pages* workflow by hand (Actions → Pages → Run workflow) after enabling
 Pages with "GitHub Actions" as the source.

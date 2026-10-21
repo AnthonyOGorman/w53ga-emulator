@@ -36,7 +36,7 @@ worker.onmessage = (e) => {
     case 'started':
       started = true; running = true; paused = false; startedMode = m.mode;
       $('overlay').classList.add('hidden');
-      msg([m.mode === 'power-on' ? 'Switched on: the unit boots from reset (about 45 s to the map).' : 'State resumed.', m.note, m.profile ? `HLE profile: ${m.profile}.` : 'HLE off: 2D graphics calls are not drawn.', m.skipped ? `Skipped (not 8.3 names): ${m.skipped}` : ''].filter(Boolean).join(' '), 'ok');
+      msg([m.mode === 'power-on' ? 'Switched on: the unit boots from reset (about 45 s to the map).' : 'State resumed.', m.note, m.profile ? `HLE profile: ${m.profile}.` : 'HLE off: 2D graphics calls are not drawn.', m.skipped ? `Skipped (not 8.3 names): ${m.skipped}` : '', m.mode === 'power-on' && m.card && !m.cid ? 'No card CID given: the unit will report an SD card error and the map will have no data (see README, "Card CID").' : ''].filter(Boolean).join(' '), 'ok');
       refresh();
       break;
     case 'stopped': running = false; msg('Stopped: ' + m.reason, 'err'); refresh(); break;

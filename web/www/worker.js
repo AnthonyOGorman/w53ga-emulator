@@ -169,7 +169,7 @@ onmessage = async (e) => {
         ex.emu_status();
         const profile = JSON.parse(text()).profile;
         running = true; paused = false; emuMs = 0; wallStart = performance.now(); statusWall = wallStart; statusEmu = 0;
-        postMessage({ type: 'started', mode: m.mode, note, skipped: skipped.split('\n').filter(Boolean).slice(0, 5).join(', '), profile });
+        postMessage({ type: 'started', mode: m.mode, note, card: m.files.length > 0, cid: !!m.cid, skipped: skipped.split('\n').filter(Boolean).slice(0, 5).join(', '), profile });
         loop();
         break;
       }

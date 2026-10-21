@@ -95,8 +95,21 @@
         <span class="val" id="val-sd">not chosen</span>
       </div>
       <div class="file-row compact">
-        <label class="fl" for="in-cid"><b>Card CID</b><span class="note">your card's 32-digit CID: the map data is bound to the card, without it the map stays empty</span></label>
+        <label class="fl" for="in-cid"><b>Card CID</b><span class="note">needed for the map: your card's 32-digit CID</span></label>
         <input id="in-cid" class="text mono" placeholder="e.g. 0353445355303847…" spellcheck="false" autocomplete="off">
+        <details class="cid-help">
+          <summary>⚠ Without it no map data loads. How do I get it?</summary>
+          <p>The unit's map database is bound to the card it was written to. Without that card's CID the unit reports an
+            SD card error at start-up and the map stays empty.</p>
+          <p>The CID is built into the card, not a file, and USB card readers hide it. Read it where the card sits in a
+            built-in slot:</p>
+          <ul>
+            <li><b>Linux</b> (laptop SD slot, Raspberry Pi): <code>cat /sys/block/mmcblk0/device/cid</code></li>
+            <li><b>Android</b> with a microSD slot (often needs root): <code>cat /sys/class/mmc_host/mmc*/mmc*:*/cid</code></li>
+          </ul>
+          <p>Paste the 32 hex digits here. Keep it private: it identifies your card.
+            <a href="https://github.com/OWNER/w53ga-emulator#card-cid" target="_blank" rel="noopener">README: Card CID</a></p>
+        </details>
       </div>
       <details class="adv">
         <summary>More files</summary>

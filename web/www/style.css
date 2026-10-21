@@ -163,3 +163,9 @@ select { padding: 6px 9px; border-radius: 8px; border: 1px solid var(--line); ba
 .dropzone div { padding: 28px 40px; border: 2px dashed var(--accent); border-radius: 16px; background: var(--panel); font-size: 18px; font-weight: 600; }
 
 .foot { color: var(--muted); font-size: 12px; text-align: center; padding: 8px 24px 28px; max-width: 900px; margin: 0 auto; }
+
+.cid-help { flex-basis: 100%; font-size: 12.5px; color: var(--muted); }
+.cid-help summary { cursor: pointer; color: var(--warn); font-weight: 600; }
+.cid-help p, .cid-help ul { margin: 6px 0; }
+.cid-help ul { padding-left: 18px; }
+.cid-help code { font-size: 11.5px; word-break: break-all; }

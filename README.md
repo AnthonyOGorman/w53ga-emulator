@@ -26,6 +26,7 @@ through WebAssembly.
 - [Status](#status)
 - [Architecture](#architecture)
 - [HLE profiles](#hle-profiles)
+- [Card CID](#card-cid)
 - [Power-on state](#power-on-state)
 - [Accuracy and limitations](#accuracy-and-limitations)
 - [Building and testing](#building-and-testing)
@@ -42,7 +43,7 @@ write SD card changes back).
 | **Flash image** | A complete read of the main board's 32 MiB parallel NOR flash (exactly 33,554,432 bytes). It holds the boot loader, the main program, its graphics and the unit's settings. |
 | **Controller image** | The RL78/G13 controller's code flash: a 1 MiB image of both 512 KiB banks, or an update package that carries one behind an 88-byte header. |
 | **SD card folder** | A copy of the files on the unit's microSD card (map, sound and data files). The emulator builds a virtual FAT32 SDHC card from the folder on the fly; nothing is copied. |
-| **Card CID** | The 16-byte card identification register of your card, as 32 hex digits. The unit's map database is bound to the card it was written to: without that card's CID the unit runs but its map stays blank (Linux shows it in `/sys/block/mmcblk0/device/cid` for a card in a built-in reader; most USB readers do not expose it). |
+| **Card CID** | Your card's 16-byte identification register, as 32 hex digits. **Needed for the map:** the unit's map database is bound to the card it was written to, so without the CID the unit reports an SD card error at start-up and the map loads no data. See [Card CID](#card-cid) for how to read it. |
 | **HLE profile** *(optional, see below)* | A small JSON file naming a few entry points in your main program. Without one, the emulator finds them itself while the program runs. |
 
 How you read these from your own hardware is up to you and outside the scope of this project; use only what you are
@@ -70,7 +71,8 @@ Then, in the page:
    System Access API and the folder is **read/write**: what the unit writes to its card can be written back with
    *Write SD changes*. Other browsers fall back to a read-only folder picker; writes then last for the session only.
    A folder can also be dropped onto the page.
-4. Optionally the card CID, and under *More files* an HLE profile, a power-on state or a saved state.
+4. **Card CID** of the card the folder was copied from ([how to get it](#card-cid)); without it the map loads no data.
+   Optionally, under *More files*, an HLE profile, a power-on state or a saved state.
 5. **Power on**. The unit boots from reset (about 45 s of emulated time to the map) or *Resume state* continues a
    saved one.
 
@@ -275,6 +277,30 @@ placed in `profiles/` before building are built in and chosen automatically when
 
 **With HLE off** (`--hle none`) the unit still runs, but nothing drawn through the RGAH API appears and it runs more
 slowly. This repository ships no profile.
+
+## Card CID
+
+> **Without the right CID the map loads no data.** The unit shows an SD card error at start-up, then runs with an
+> empty map. Everything else works.
+
+Every SD card has a CID (card identification register) programmed into its controller at the factory: 16 bytes
+holding the maker, product name, serial number and date. It is not a file, so copying the card's files does not carry
+it over. The unit's map database is bound to the card it was written to, and the unit checks it against the CID of the
+card it reads. The emulator therefore has to present your card's CID along with the copied files: enter it as 32 hex
+digits (spaces and colons are ignored) in the page's **Card CID** box, or with `--sd-cid HEX` natively.
+
+The CID can only be read where the card is connected to an SD host controller directly. USB card readers present the
+card as a plain disk and hide it, so on most Windows and macOS computers it cannot be read.
+
+| Where | How |
+|---|---|
+| **Linux, built-in SD slot** (most laptops with a slot; a live USB stick will do) | `cat /sys/block/mmcblk0/device/cid` (the card may be `mmcblk1`; `lsblk` shows which) |
+| **Raspberry Pi** | Put the card in the Pi's slot while it boots from USB, or read it from a second Pi: `cat /sys/block/mmcblk0/device/cid` |
+| **Android phone with a microSD slot** | `cat /sys/class/mmc_host/mmc*/mmc*:*/cid` in a terminal or `adb shell` (recent Android versions need root) |
+| **Windows / macOS with a USB reader** | Usually not possible; use one of the above |
+
+The result is one line of 32 hex digits. The CID identifies your physical card: treat it like the other personal
+files and do not publish it.
 
 ## Power-on state
 

@@ -14,6 +14,7 @@ let powerOnAvailable = false, wasmReady = false;
 let running = false, paused = false, started = false, startedMode = '';
 let lastStatus = null, sdDirty = false;
 let heading = 0, car = null;
+let gpsCut = false;
 
 // ---------------------------------------------------------------- worker
 const worker = new Worker('worker.js');
@@ -35,6 +36,7 @@ worker.onmessage = (e) => {
     case 'status': onStatus(m.status); break;
     case 'started':
       started = true; running = true; paused = false; startedMode = m.mode;
+      showCut(false);
       $('overlay').classList.add('hidden');
       msg([m.mode === 'power-on' ? 'Switched on: the unit boots from reset (about 45 s to the map).' : 'State resumed.', m.note, m.profile ? `HLE profile: ${m.profile}.` : 'HLE off: 2D graphics calls are not drawn.', m.skipped ? `Skipped (not 8.3 names): ${m.skipped}` : '', m.mode === 'power-on' && m.card && !m.cid ? 'No card CID given: the unit will report an SD card error and the map will have no data (see README, "Card CID").' : ''].filter(Boolean).join(' '), 'ok');
       refresh();
@@ -231,7 +233,12 @@ function onStatus(s) {
   $('st-time').textContent = `${s.t.toFixed(1)} s`;
   const gps = $('st-gps');
   gps.hidden = !s.gps;
-  if (s.gps) { gps.innerHTML = `GPS <b>${s.gps.lat.toFixed(4)}, ${s.gps.lon.toFixed(4)}</b> · ${s.gps.speed.toFixed(0)} km/h`; car = [s.gps.lat, s.gps.lon]; if (carMarker) carMarker.setLatLng(car); }
+  if (s.gps) {
+    const sky = s.gps.cut ? ' · <span class="cut">no fix (tunnel)</span>' : s.gps.fix === false ? ' · <span class="cut">acquiring</span>' : '';
+    gps.innerHTML = `GPS <b>${s.gps.lat.toFixed(4)}, ${s.gps.lon.toFixed(4)}</b> · ${(s.gps.actual ?? s.gps.speed).toFixed(0)} km/h${sky}`;
+    car = [s.gps.lat, s.gps.lon]; if (carMarker) carMarker.setLatLng(car);
+    $('gps-cut-note').textContent = s.gps.cut ? 'In the tunnel: no GPS fix, the car drives on' : s.gps.fix === false ? 'Out of the tunnel: re-acquiring…' : 'GPS sky clear';
+  }
   const acc = [];
   if (s.obd2) acc.push(`OBD ${s.obd2.streaming ? Math.round(s.obd2.rpm) + ' rpm' : 'connecting'}`);
   if (s.dvr !== null && s.dvr !== undefined) acc.push(`DVR ${s.dvr ? 'linked' : 'waiting'}`);
@@ -271,6 +278,7 @@ addEventListener('keydown', (e) => {
   if (e.key in keyCodes) { e.preventDefault(); if (!e.repeat) worker.postMessage({ cmd: 'key', code: keyCodes[e.key] }); }
   else if (e.key === 'p' || e.key === 'P') togglePause();
   else if (e.key === 's' || e.key === 'S') screenshot();
+  else if (e.key === 't' || e.key === 'T') toggleCut();
 });
 
 // ---------------------------------------------------------------- accessories
@@ -285,8 +293,20 @@ document.querySelectorAll('.seg button').forEach((b) => b.addEventListener('clic
   document.querySelectorAll('.tab').forEach((p) => { p.hidden = p.dataset.pane !== b.dataset.tab; });
 }));
 function speed() { return +$('gps-speed').value; }
+// tunnel: the GPS sky is blocked (no fix) while the drive goes on
+function showCut(on) {
+  gpsCut = on;
+  const b = $('gps-cut');
+  b.classList.toggle('on', on); b.setAttribute('aria-pressed', on); b.textContent = on ? 'Leave tunnel' : 'Enter tunnel';
+}
+function toggleCut() {
+  if (!started) return msg('Start the unit first.', 'err');
+  showCut(!gpsCut);
+  worker.postMessage({ cmd: 'gpscut', on: gpsCut });
+}
+$('gps-cut').addEventListener('click', toggleCut);
 function sendRoute(text, hold) {
-  const pts = text.split(/\r?\n/).map((l) => l.split('#')[0]).flatMap((l) => l.split(';')).map((p) => p.trim()).filter((p) => /^-?[\d.]+\s*,\s*-?[\d.]+$/.test(p));
+  const pts = text.split(/\r?\n/).map((l) => l.split('#')[0]).flatMap((l) => l.split(';')).map((p) => p.trim()).filter((p) => /^-?[\d.]+\s*,\s*-?[\d.]+(\s*,\s*-?[\d.]+)?$/.test(p));
   if (!pts.length) return msg('The route has no points.', 'err');
   if (!started) { msg('Start the unit first, then choose the route.', 'err'); return; }
   worker.postMessage({ cmd: 'route', route: pts.join(';'), speed: speed(), hold });

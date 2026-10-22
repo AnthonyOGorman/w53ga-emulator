@@ -181,6 +181,7 @@ onmessage = async (e) => {
       case 'route': if (str(m.route, ex.emu_gps_route, m.speed, m.hold ? 1 : 0) !== 0) postMessage({ type: 'error', message: 'GPS: ' + text() }); break;
       case 'speed': ex.emu_gps_speed(m.speed); break;
       case 'radar': ex.emu_radar(m.strength); break;
+      case 'gpscut': ex.emu_gps_cut(m.on ? 1 : 0); break;
       case 'accessories': ex.emu_accessories(m.obd2 ? 1 : 0, m.dvr ? 1 : 0); break;
       case 'wifi': str(m.spec, ex.emu_wifi); wifi = !!m.spec; break;
       case 'obd': ex.emu_obd(m.speed, m.rpm, m.coolant, m.intake, m.throttle, m.load, m.boost, m.battery, m.follow ? 1 : 0); break;

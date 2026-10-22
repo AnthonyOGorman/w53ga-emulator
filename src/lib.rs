@@ -18,6 +18,7 @@ pub mod fat32;
 pub mod gfx;
 pub mod gnss;
 pub mod hle;
+pub mod imu;
 pub mod intc;
 pub mod machine;
 pub mod mem;

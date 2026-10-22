@@ -6,7 +6,7 @@
 //!
 //! Keys: arrows = remote up/down/left/right, Enter = ENT, Backspace = BACK, F1..F5 = the other remote buttons
 //! (codes 0x10, 0x11, 0x12, 0x64, 0xFF), +/- = GPS speed ±10 km/h, G = GPS stop/go, R = radar off/weak/medium/strong,
-//! P = pause, S = screenshot (BMP), F9 = save state, Esc = quit.
+//! T = tunnel (GPS sky blocked, the drive goes on), P = pause, S = screenshot (BMP), F9 = save state, Esc = quit.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use minifb::{Key, KeyRepeat, Window, WindowOptions};
@@ -22,7 +22,7 @@ const W: usize = 400;
 const H: usize = 240;
 
 fn usage() -> ! {
-    eprintln!("usage: w53ga --flash FLASH.bin --rl78 CONTROLLER.bin [--sd FOLDER] [options]\n       w53ga --flash FLASH.bin --state SAVED.state [options]\n\n{OPTIONS_HELP}\n  --scale N               window scale (default 2)\n  --unpaced               run as fast as possible instead of real time\n  --save-flash FILE       on exit, write the NOR flash as it is then (e.g. after a software update)\n\nKeys: arrows/Enter/Backspace = remote, F1-F5 = other remote buttons, +/- GPS speed, G GPS stop/go, R radar off/weak/medium/strong,\n      P pause, S screenshot, F9 save state, Esc quit.");
+    eprintln!("usage: w53ga --flash FLASH.bin --rl78 CONTROLLER.bin [--sd FOLDER] [options]\n       w53ga --flash FLASH.bin --state SAVED.state [options]\n\n{OPTIONS_HELP}\n  --scale N               window scale (default 2)\n  --unpaced               run as fast as possible instead of real time\n  --save-flash FILE       on exit, write the NOR flash as it is then (e.g. after a software update)\n\nKeys: arrows/Enter/Backspace = remote, F1-F5 = other remote buttons, +/- GPS speed, G GPS stop/go, R radar off/weak/medium/strong, T tunnel,\n      P pause, S screenshot, F9 save state, Esc quit.");
     std::process::exit(2)
 }
 
@@ -35,7 +35,7 @@ fn main() {
     let options = Options::parse(&args).unwrap_or_else(|e| { eprintln!("{e}"); usage() });
     let mut m = options.build().unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1) });
     let paced = !has("--unpaced");
-    println!("running (arrows/Enter/Backspace = remote, F1-F5 buttons, +/- GPS speed, G GPS stop/go, P pause, S screenshot, F9 save state, Esc quit)");
+    println!("running (arrows/Enter/Backspace = remote, F1-F5 buttons, +/- GPS speed, G GPS stop/go, T tunnel, P pause, S screenshot, F9 save state, Esc quit)");
 
     // Audio: SSI0 frames are pushed into a shared queue; the output callback resamples to the device rate.
     let audio: Arc<Mutex<VecDeque<(i16, i16)>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -85,6 +85,10 @@ fn main() {
                     *r = match *r { x if x < 0.3 => 0.35, x if x < 0.6 => 0.7, x if x < 0.9 => 1.0, _ => 0.0 };
                     println!("radar {}", if *r == 0.0 { "off".to_string() } else { format!("strength {:.0}%", *r * 100.0) });
                 },
+                Key::T => if let Some(g) = m.board.companion.as_mut().and_then(|c| c.gnss.as_mut()) {
+                    g.cut = !g.cut;
+                    println!("{}", if g.cut { "tunnel: GPS sky blocked (no fix), the drive goes on" } else { "tunnel exit: GPS sky clear" });
+                },
                 _ => {}
             }
         }
@@ -125,7 +129,7 @@ fn main() {
         }
         if last_title.elapsed() > Duration::from_millis(500) {
             let speed = (m.steps - title_steps) as f64 / P0_HZ / title_t.elapsed().as_secs_f64();
-            let mut extra = m.board.companion.as_ref().and_then(|c| c.gnss.as_ref()).map_or(String::new(), |g| format!("  GPS {} km/h", g.speed_kmh));
+            let mut extra = m.board.companion.as_ref().and_then(|c| c.gnss.as_ref()).map_or(String::new(), |g| format!("  GPS {} km/h{}", g.speed_kmh, if g.sky_blocked(m.steps as f64 / P0_HZ) { " (tunnel: no fix)" } else { "" }));
             if let Some(c) = &m.board.companion { if c.g13.rx.radar > 0.0 { extra += &format!("  RADAR {:.0}%", c.g13.rx.radar * 100.0); } }
             if let Some(o) = &m.board.obd2 { extra += &format!("  OBD {:.0} rpm{}", o.car.rpm, if o.streaming { "" } else { " (idle)" }); }
             if let Some(d) = &m.board.dvr { extra += &format!("  DVR {}", if d.polls > 0 { "linked" } else { "waiting" }); }

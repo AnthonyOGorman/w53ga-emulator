@@ -5,7 +5,8 @@
 //! The sensor is an MPU-6500-compatible register file at 7-bit address 0x69 (wire 0xD2/0xD3): writes set the
 //! register pointer then auto-increment data; reads auto-increment. Other addresses (the absent pressure sensors
 //! the firmware probes) NACK. Initial values (fixture): WHO_AM_I (0x75) = 0x70, register 0x00
-//! = 0, and a stationary level sample (+1 g on Z, 21 C, no rotation) in 0x3B..0x48; tests/UI can change them.
+//! = 0, and a stationary level sample (-1 g on Y, which points down in the unit, 21 C, no rotation) in 0x3B..0x48.
+//! While running, `crate::imu` writes the samples of the emulated vehicle's motion at the chip's sample rate.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -47,7 +48,7 @@ impl Sensor {
     pub fn stationary() -> Sensor {
         let mut regs = [0u8; 128];
         regs[0x75] = 0x70;
-        let sample = [0x00u8, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]; // AX AY AZ T GX GY GZ
+        let sample = [0x00u8, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]; // AX AY AZ T GX GY GZ
         regs[0x3B..0x49].copy_from_slice(&sample);
         Sensor { regs, phase: Phase::Idle, ptr: 0, address7: 0x69 }
     }
@@ -104,6 +105,9 @@ pub struct Iic2 {
     /// Devices on the bus; `cur` is the one addressed in the current transfer.
     pub devices: Vec<Sensor>,
     cur: Option<usize>,
+    /// Motion samples of the inertial sensor (IIC2).
+    #[serde(skip)]
+    pub imu: crate::imu::Imu,
 }
 
 type R<T> = Result<T, String>;
@@ -152,7 +156,7 @@ impl Iic2 {
             rx_started: x.rx_started, rx_available: x.rx_available, multi_final_nack: x.multi_rx_final_nack, multi_transaction: x.multi_rx_transaction,
             multi_completed: x.multi_rx_completed, multi_launched_ack: x.multi_rx_launched_ack, pending: Pending::parse(&x.pending)?, now: x.now, due: x.due,
             reads: x.reads, writes: x.writes, starts: x.starts, stops: x.stops, transmitted: x.transmitted, received: x.received,
-            multibyte: x.multibyte, base, devices: vec![sensor], cur,
+            multibyte: x.multibyte, base, devices: vec![sensor], cur, imu: Default::default(),
         })
     }
 
@@ -178,6 +182,13 @@ impl Iic2 {
     }
     /// Inertial sensor register file (for front-end tilt/motion input), if on this bus.
     pub fn sensor(&mut self) -> Option<&mut Sensor> { self.devices.iter_mut().find(|d| d.address7 == 0x69) }
+
+    /// IIC2: the inertial sensor's next sample of the vehicle's motion (driven by the GNSS route, else standing).
+    #[inline]
+    pub fn update_motion(&mut self, now: u64, gnss: Option<&mut crate::gnss::Gnss>) {
+        if self.base != BASE || !self.imu.due(now) { return; }
+        if let Some(i) = self.devices.iter().position(|d| d.address7 == 0x69) { self.imu.update(now, &mut self.devices[i].regs, gnss); }
+    }
 
     pub fn read(&mut self, a: u32, n: usize) -> R<u64> {
         let o = self.offset(a, n)?;

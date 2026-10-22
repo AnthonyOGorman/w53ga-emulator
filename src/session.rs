@@ -31,6 +31,8 @@ pub struct Options {
     /// GPS route "lat,lon;lat,lon;..." or "@FILE", speed in km/h.
     pub gps: Option<String>,
     pub gps_speed: Option<f64>,
+    /// Spans of emulated time (seconds) with the GPS sky blocked, like a tunnel: no fix while the drive goes on.
+    pub gps_cut: Vec<(f64, f64)>,
 }
 
 pub const OPTIONS_HELP: &str = "\
@@ -48,8 +50,10 @@ pub const OPTIONS_HELP: &str = "\
   --obd2                  plug in the OBD-II adapter
   --dvr                   plug in the drive recorder and its camera
   --wifi [SSID[:PASS]]    fit the Wi-Fi module with one virtual access point bridged to this computer's network
-  --gps ROUTE             drive the GNSS receiver along \"lat,lon;lat,lon;...\" or @FILE (one point per line)
-  --gps-speed KMH         route speed (default 50)";
+  --gps ROUTE             drive the GNSS receiver along \"lat,lon;lat,lon;...\" or @FILE (one point per line;
+                          \"lat,lon,alt\" with altitudes in metres for hills)
+  --gps-speed KMH         route speed (default 50)
+  --gps-cut FROM-TO[;..]  block the GPS sky (a tunnel) from FROM to TO emulated seconds: no fix, the drive goes on";
 
 impl Options {
     /// Parse the options above from `args` (other arguments are left for the caller).
@@ -71,6 +75,7 @@ impl Options {
             wifi: if has("--wifi") { Some(opt("--wifi").unwrap_or_default()) } else { None },
             gps: opt("--gps"),
             gps_speed: opt("--gps-speed").map(|s| s.parse().map_err(|_| format!("--gps-speed: not a number: {s}"))).transpose()?,
+            gps_cut: opt("--gps-cut").map(|s| crate::gnss::parse_spans(&s).map_err(|e| format!("--gps-cut: {e}"))).transpose()?.unwrap_or_default(),
             ..Default::default()
         };
         for (i, a) in args.iter().enumerate() {
@@ -125,9 +130,11 @@ impl Options {
         if let Some(c) = m.board.companion.as_mut() {
             c.refresh_debug_env();
             if let Some(r) = &self.gps {
-                let wp = crate::gnss::parse_route(r)?;
+                let (wp, alts) = crate::gnss::parse_route_alt(r)?;
                 let mut g = crate::gnss::Gnss::new(wp, self.gps_speed.unwrap_or(50.0));
                 g.start_after = c.now() + 3_333_333;
+                g.altitudes = alts;
+                g.cut_spans = self.gps_cut.clone();
                 c.gnss = Some(g);
             }
         }

@@ -711,6 +711,7 @@ impl Board {
         crate::prof::set(crate::prof::SERIAL);
         if let Some(c) = &mut self.iic2 { if let Err(e) = c.advance_p0(self.p0_per_step) { self.fault.get_or_insert(format!("IIC2 clock: {e}")); } }
         if let Some(c) = &mut self.iic1 { if let Err(e) = c.advance_p0(self.p0_per_step) { self.fault.get_or_insert(format!("IIC1 clock: {e}")); } }
+        if let Some(c) = &mut self.iic2 { c.update_motion(self.now, self.companion.as_mut().and_then(|c| c.gnss.as_mut())); }
         if let Some(c) = &mut self.companion { c.advance(self.p0_per_step, self.scif7.as_mut()); }
         crate::prof::set(crate::prof::SERIAL);
         if let Some(s) = &mut self.scif7 {

@@ -12,7 +12,7 @@ use w53ga_emu::session::{Options, OPTIONS_HELP};
 const P0_HZ: f64 = 100.0e6 / 3.0;
 
 fn usage() -> ! {
-    eprintln!("usage: w53ga-headless --flash FLASH.bin (--rl78 CONTROLLER.bin | --state SAVED.state) --seconds S [options]\n\n{OPTIONS_HELP}\n  --seconds S             emulated time to run (default 10)\n  --frame FILE.bmp        write the screen at the end (landscape, as the unit shows it)\n  --every S               with --frame: also write FILE-<t>.bmp every S emulated seconds\n  --ir CODE@S,...         remote presses: command code (hex) at emulated second S, e.g. 09@60,01@62\n  --save-state FILE       save the machine at the end (contains the flash image and RAM: keep it private)\n  --wav FILE              record the audio output\n  --dump-mem ADDR,LEN,FILE  write main-CPU memory (hex address and length) at the end\n  --save-flash FILE       write the NOR flash as it is at the end\n  --dump-rspi FILE        write the bytes sent on RSPI0 and RSPI1 (hex, one line per channel), e.g. the panel set-up\n  --dump-vdc FILE         write every VDC4 register (address, name, shadow and active value) at the end\n\nDiagnostics (environment): AR_MMIO_LOG=FILE logs every MMIO store; AR_LINK_LOG=1 (or full) logs the controller link.\n\nProfile writer (checks computed from the flash image; addresses in hex):\n  w53ga-headless --flash FLASH.bin --make-profile OUT.json --name NAME [--idle ADDR] [--rgah FILL,DRAW,BLT,BLTFC,FINISH]");
+    eprintln!("usage: w53ga-headless --flash FLASH.bin (--rl78 CONTROLLER.bin | --state SAVED.state) --seconds S [options]\n\n{OPTIONS_HELP}\n  --seconds S             emulated time to run (default 10)\n  --frame FILE.bmp        write the screen at the end (landscape, as the unit shows it)\n  --every S               with --frame: also write FILE-<t>.bmp every S emulated seconds\n  --ir CODE@S,...         remote presses: command code (hex) at emulated second S, e.g. 09@60,01@62\n  --save-state FILE       save the machine at the end (contains the flash image and RAM: keep it private)\n  --wav FILE              record the audio output\n  --dump-mem ADDR,LEN,FILE  write main-CPU memory (hex address and length) at the end\n  --save-flash FILE       write the NOR flash as it is at the end\n  --dump-rspi FILE        write the bytes sent on RSPI0 and RSPI1 (hex, one line per channel), e.g. the panel set-up\n  --dump-vdc FILE         write every VDC4 register (address, name, shadow and active value) at the end\n  --peek ADDR,LEN[;...]   print main-CPU memory (hex address and length) and the GPS state every --peek-every S\n                          emulated seconds (default 1)\n\nDiagnostics (environment): AR_MMIO_LOG=FILE logs every MMIO store; AR_LINK_LOG=1 (or full) logs the controller link.\n\nProfile writer (checks computed from the flash image; addresses in hex):\n  w53ga-headless --flash FLASH.bin --make-profile OUT.json --name NAME [--idle ADDR] [--rgah FILL,DRAW,BLT,BLTFC,FINISH]");
     std::process::exit(2)
 }
 
@@ -46,6 +46,17 @@ fn save_frame(m: &Machine, path: &Path) {
     match write_bmp(path, w, h, &px) { Ok(()) => println!("frame {} ({w}x{h}) at t={:.2}s", path.display(), m.steps as f64 / P0_HZ), Err(e) => println!("{}: {e}", path.display()) }
 }
 
+/// One `--peek` line: the GPS receiver's state and the requested memory.
+fn print_peek(m: &Machine, peeks: &[(u32, u32)]) {
+    let t = m.steps as f64 / P0_HZ;
+    let gps = m.board.companion.as_ref().and_then(|c| c.gnss.as_ref()).map_or("no GPS".to_string(), |g| {
+        let f = g.current();
+        format!("gps {:.6},{:.6} {:.1} km/h {:.1} deg {}", f.lat, f.lon, f.speed_kmh, f.heading, if g.has_fix(t) { "fix" } else if g.sky_blocked(t) { "CUT" } else { "no-fix" })
+    });
+    let mem: Vec<String> = peeks.iter().map(|&(a, n)| format!("{a:08x}:{}", (0..n).map(|k| m.cpu.mem.load_bytes(a + k, 1).map_or("??".into(), |b| format!("{:02x}", b[0]))).collect::<String>())).collect();
+    println!("peek t={t:.2} {gps} {}", mem.join(" "));
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 || args.iter().any(|a| a == "-h" || a == "--help") { usage(); }
@@ -65,6 +76,11 @@ fn main() {
         ((t * P0_HZ) as u64, u8::from_str_radix(c.trim_start_matches("0x"), 16).unwrap_or_else(|_| usage()))
     }).collect()).unwrap_or_default();
     presses.sort();
+    let peeks: Vec<(u32, u32)> = opt("--peek").map(|s| s.split(';').filter(|x| !x.is_empty()).map(|x| {
+        let (a, n) = x.split_once(',').unwrap_or_else(|| usage());
+        (hex(a).unwrap_or_else(|_| usage()), hex(n).unwrap_or_else(|_| usage()))
+    }).collect()).unwrap_or_default();
+    let peek_every = ((opt("--peek-every").map_or(1.0, |s| s.parse().unwrap_or_else(|_| usage())) * P0_HZ) as u64).max(1);
     let wav = opt("--wav").map(PathBuf::from);
     if wav.is_some() { if let Some(s) = &mut m.board.ssi { s.capture = Some(Vec::new()); } }
 
@@ -73,17 +89,19 @@ fn main() {
     let end = start + (seconds * P0_HZ) as u64;
     let every_steps = every.map(|e| ((e * P0_HZ) as u64).max(1));
     let mut next_frame = every_steps.map_or(u64::MAX, |e| start + e);
+    let mut next_peek = if peeks.is_empty() { u64::MAX } else { start + peek_every };
     let mut result = Ok(());
     while m.steps < end {
         while let Some(&(at, cmd)) = presses.first() { if at <= m.steps { m.board.ir.press(m.steps, cmd, 0); println!("remote 0x{cmd:02x} at t={:.2}s", m.steps as f64 / P0_HZ); presses.remove(0); } else { break; } }
         let next_press = presses.first().map_or(u64::MAX, |p| p.0);
-        let stop = end.min(next_frame).min(next_press.max(m.steps + 1));
+        let stop = end.min(next_frame).min(next_peek).min(next_press.max(m.steps + 1));
         result = m.run(stop - m.steps);
         if result.is_err() { break; }
         if m.steps >= next_frame {
             if let Some(f) = &frame { let stem = f.file_stem().unwrap_or_default().to_string_lossy(); save_frame(&m, &f.with_file_name(format!("{stem}-{:07.2}.bmp", m.steps as f64 / P0_HZ))); }
             next_frame += every_steps.unwrap_or(u64::MAX);
         }
+        if m.steps >= next_peek { print_peek(&m, &peeks); next_peek += peek_every; }
     }
     let secs = t0.elapsed().as_secs_f64();
     w53ga_emu::machine::mmio_log_flush();

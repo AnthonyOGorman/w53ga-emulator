@@ -83,10 +83,12 @@ Then, in the page:
 While it runs: the screen is shown at the largest whole-number scale that fits (or 1×/2×/3×), crisp and unfiltered; the
 status bar shows the emulated time, the speed relative to real time, the GPS fix and the accessories. The on-screen
 remote and the keyboard (arrows, <kbd>Enter</kbd> = ENT, <kbd>Backspace</kbd> = BACK, <kbd>F1</kbd>–<kbd>F5</kbd> =
-the other buttons, <kbd>P</kbd> pause, <kbd>S</kbd> screenshot) control the unit. **GPS**: play back a route (a sample
-route round the Imperial Palace in Tokyo is included; any text file with one `lat,lon` per line works), steer
-manually with a heading and speed, or open an OpenStreetMap view to click where to drive (only that view fetches map
-tiles from openstreetmap.org, and only when you open it). **Screenshot** saves a PNG; **Save state** downloads the whole
+the other buttons, <kbd>P</kbd> pause, <kbd>S</kbd> screenshot, <kbd>T</kbd> tunnel) control the unit. **GPS**: play back a route (a sample
+route round the Imperial Palace in Tokyo is included; any text file with one `lat,lon` (or `lat,lon,alt`) per line
+works), steer manually with a heading and speed, or open an OpenStreetMap view to click where to drive (only that view
+fetches map tiles from openstreetmap.org, and only when you open it). **Enter tunnel** (or <kbd>T</kbd>) blocks the GPS
+sky as in a tunnel: the receiver reports no fix while the car drives on, and the unit dead-reckons with its inertial
+sensor (and the OBD-II speed) until you leave the tunnel. **Screenshot** saves a PNG; **Save state** downloads the whole
 machine (it contains your flash image and RAM, so keep it private).
 
 The emulated Wi-Fi module needs `w53ga-serve`: browsers cannot open raw sockets, so the page hands the module's
@@ -106,8 +108,8 @@ target/release/w53ga --flash FLASH.bin --rl78 CONTROLLER.bin --sd path/to/SDCard
 
 | Binary | Purpose |
 |---|---|
-| `w53ga` | Window with the unit's screen at real-time speed, keyboard as the remote, audio out. Keys as in the browser, plus <kbd>+</kbd>/<kbd>-</kbd> GPS speed, <kbd>G</kbd> GPS stop/go, <kbd>F9</kbd> save state, <kbd>Esc</kbd> quit. |
-| `w53ga-headless` | Runs for a set emulated time without a window; writes screenshots (`--frame`, `--every`), saved states, audio (`--wav`), memory dumps. Also writes HLE profiles (`--make-profile`). |
+| `w53ga` | Window with the unit's screen at real-time speed, keyboard as the remote, audio out. Keys as in the browser (<kbd>T</kbd> tunnel included), plus <kbd>+</kbd>/<kbd>-</kbd> GPS speed, <kbd>G</kbd> GPS stop/go, <kbd>F9</kbd> save state, <kbd>Esc</kbd> quit. |
+| `w53ga-headless` | Runs for a set emulated time without a window; writes screenshots (`--frame`, `--every`), saved states, audio (`--wav`), memory dumps, periodic memory and GPS readouts (`--peek`). Also writes HLE profiles (`--make-profile`). |
 | `w53ga-serve` | Tiny local web server for the browser version (127.0.0.1 only), with the Wi-Fi relay. |
 | `rl78-run` | The RL78 controller on its own: disassembler, traces, SFR access report (a development tool). |
 
@@ -128,6 +130,8 @@ Common options (all front ends; `--help` lists them):
 --obd2 / --dvr          plug in the OBD-II adapter / the drive recorder and its camera
 --wifi [SSID[:PASS]]    fit the Wi-Fi module with one virtual access point bridged to this computer's network
 --gps ROUTE             drive the GNSS receiver along "lat,lon;lat,lon;..." or @FILE; --gps-speed KMH
+                        (points may carry an altitude, "lat,lon,alt" in metres, for hills)
+--gps-cut FROM-TO[;..]  block the GPS sky (a tunnel) from FROM to TO seconds of emulated time: no fix, the drive goes on
 ```
 
 Without `--sd-readonly`, what the unit wrote to its card is copied back into the SD folder when the emulator exits
@@ -153,7 +157,7 @@ cleanly or if more than 20 files would be deleted). Work on a copy of your card'
 | **SCIF** | FIFO serial channels 1 (drive recorder), 6 (OBD-II) and 7 (controller link): bit timing from SCBRR, FIFOs, triggers, flags, DMA requests. |
 | **DMAC** | 16 channels, cycle-steal transfers, request selection (DMARS), half/full-count interrupts. |
 | **Timers** | CMT0/1; MTU2 channel 1 (IR remote capture) and channels 3/4; watchdog timer with chip reset. |
-| **RIIC** | IIC1 (audio codec register file) and IIC2 with an MPU-6500-compatible 6-axis inertial sensor. |
+| **RIIC** | IIC1 (audio codec register file) and IIC2 with an MPU-6500-compatible 6-axis inertial sensor that measures the drive: gravity, speeding up and braking, cornering (yaw rate and lateral acceleration), grade and road vibration, in the axes, ranges and sample rate the unit's program sets up. No barometer is fitted (the program probes for one and finds none). |
 | **Audio** | SRC0 sampling-rate converter and SSI0 serial sound interface, to the host's audio device. |
 | **Other** | RTC (BCD calendar from EXTAL), A/D converter (supply voltage), RSPI register files, PWM registers, standby/clock registers, and a generic latch model with reset values and access rules for registers without behaviour. |
 
@@ -164,7 +168,7 @@ cleanly or if more than 20 files would be deleted). Work on a copy of your card'
 | **RL78/G13** | R5F100LLA: RL78-S3 core with instruction timing, register banks, interrupts and priorities; clock generator, timer array unit, serial array unit (UART and CSI), A/D converter (internal temperature sensor and reference), multiplier/divider, ports, data flash, self-programming through the Renesas boot-ROM flash library (emulated at its command level), watchdog reset. |
 | **Serial NOR flash** | 4 MiB SPI flash on the controller's CSI20 (read, page program, sector/block/chip erase, status, ID). |
 | **Controller link** | The real controller program talks to the main program over SCIF7 ⇄ UART1, as on the board. |
-| **GNSS receiver** | An NMEA receiver on the controller's UART0 (RMC/GGA/GNS/GSV with GPS and GLONASS satellites), driving along a route at a set speed, answering configuration commands. |
+| **GNSS receiver** | An NMEA receiver on the controller's UART0 (RMC/GGA/GNS/GSV with GPS and GLONASS satellites), driving along a route at a set speed (standing for the first 15 s after power-on while the unit zeroes its G-sensor, then accelerating and braking gently and rounding corners), answering configuration commands. In a tunnel (sky blocked) it keeps reporting once a second without a fix, and re-acquires two seconds after the sky clears. |
 | **IR remote** | NEC-format remote (customer code 0x84E4) as demodulated edges into MTU1 input capture. |
 | **Wi-Fi module** | SDIO 802.11 module (SDIO manufacturer 0x032C), emulated at its host interface: CIS, function registers, firmware download (the module's own firmware, which the unit's flash supplies, is checksummed but not executed), configuration protocol, scan/join with WEP/WPA keys, and data frames to a user-mode network (DHCP, DNS, TCP/UDP through host sockets, like QEMU's user networking). |
 | **OBD-II adapter** | The accessory's serial protocol: presence, configuration, diagnosis and a live stream of speed, engine speed, temperatures, load, boost and battery voltage (from a simple gearbox model following the GPS speed, or set by hand). |
@@ -194,14 +198,14 @@ Measured with the unit's own software on the development machine.
 | Speed | Depends on what the unit is doing. Natively: about 1.2× real time while booting, about 0.5× while driving through the dense map of central Tokyo (the unit's map drawing is CPU-heavy). The browser runs at roughly half the native speed. Both front ends pace to real time when they can. |
 | Display | All layer formats, blending, fades, the video plane; the unit's map, menus, standby screens and camera screens render. 2D drawing through [HLE](#hle-profiles). |
 | Controller | The real controller program runs: link handshake, mode changes, settings, GPS handling, warning database in its serial flash. |
-| GPS | The map follows the emulated receiver; routes, manual driving, map clicks. |
+| GPS | The map follows the emulated receiver; routes, manual driving, map clicks. In a tunnel (GPS cut) the unit dead-reckons from the gyro and the G-sensor or OBD-II speed, shows "- - -" for the speed without OBD-II and switches to night colours, as described in [docs/gps-loss.md](docs/gps-loss.md). |
 | SD card | Read/write FAT32 card from a folder (native: write-back on exit; browser: write-back on request with a read/write folder). |
 | Audio | Key sounds and voice prompts through SRC/SSI to the host. |
 | OBD-II, drive recorder | Recognised by the unit; engine data and camera picture shown on its screens. |
 | Wi-Fi | Module detected, scan, join (open/WEP/WPA), DHCP, DNS and TCP to the internet through the host (native, or the browser with `w53ga-serve`). |
 | Software update path | The unit's own updater can reprogram the emulated NOR flash and restart through the watchdog; the result can be saved. Controller self-updates are only partly emulated (the boot-ROM commit step is not complete). |
 | Saved states | Whole-machine save/restore (gzip + bincode). States are tied to the emulator version. |
-| Not emulated | The graphics processor's microcode, electrical timing of SD/flash, power loss, battery/ignition sensing beyond fixed values, the inertial sensor's motion (stationary), real camera input. |
+| Not emulated | The graphics processor's microcode, electrical timing of SD/flash, power loss, battery/ignition sensing beyond fixed values, the barometer (and with it the unit's pressure-based features), real camera input. |
 
 ## Architecture
 
@@ -329,7 +333,9 @@ program counter or stack pointer: the emulator reads those from the flash image'
   registers. It finds only the calls a program makes. If exploring the first drawing call ahead is cut short (another
   device touched first), that call is identified at its real hardware access instead and completed by unwinding it,
   which shifts timing by a few hundred instructions.
-- The camera picture is synthetic; the inertial sensor reports a stationary, level unit; the supply voltage is fixed.
+- The camera picture is synthetic; the supply voltage is fixed. The inertial sensor's samples come from the route (a
+  level mounting, no gyro bias or temperature drift, synthetic road vibration scaled so that the program's vibration
+  speed estimate lands near the true speed); `AR_IMU=legacy` brings back the former stationary sensor for comparison.
 - Saved states are tied to the emulator version and contain your flash image and RAM: keep them private.
 
 ## Building and testing

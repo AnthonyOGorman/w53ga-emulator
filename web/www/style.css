@@ -145,6 +145,9 @@ select { padding: 6px 9px; border-radius: 8px; border: 1px solid var(--line); ba
 #map { height: 260px; border-radius: 8px; margin-top: 8px; border: 1px solid var(--line); }
 .speedrow input[type=range] { flex: 1; accent-color: var(--accent); }
 .speedrow output { min-width: 64px; text-align: right; font-variant-numeric: tabular-nums; }
+.tunnelrow { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+.tunnelrow button.on { background: var(--warn); border-color: var(--warn); color: #fff; }
+.pill .cut { color: var(--warn); font-weight: 600; }
 
 /* OBD */
 .obd summary { cursor: pointer; list-style: none; }

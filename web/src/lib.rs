@@ -232,14 +232,14 @@ pub extern "C" fn emu_render() -> *const u32 {
 #[no_mangle]
 pub extern "C" fn emu_key(cmd: u32) { with(|e| { let now = e.m.steps; e.m.board.ir.press(now, cmd as u8, 0); }); }
 
-/// GPS route "lat,lon;lat,lon;..." at `speed` km/h (`hold`: stop at the end instead of driving back and forth).
-/// A single point places the vehicle there.
+/// GPS route "lat,lon;lat,lon;..." (or "lat,lon,alt" points, altitudes in metres) at `speed` km/h (`hold`: stop at
+/// the end instead of driving back and forth). A single point places the vehicle there.
 /// # Safety
 /// `p` must point to `n` readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn emu_gps_route(p: *const u8, n: usize, speed: f64, hold: i32) -> i32 {
     let s = text(p, n);
-    let wp: Vec<(f64, f64)> = s.split(';').filter_map(|q| { let (a, b) = q.split_once(',')?; Some((a.trim().parse().ok()?, b.trim().parse().ok()?)) }).collect();
+    let (wp, alts) = match w53ga_emu::gnss::parse_route_alt(&s) { Ok(r) => r, Err(e) => return err(e) };
     if wp.is_empty() { return err("no waypoints"); }
     with(|e| {
         let Some(c) = e.m.board.companion.as_mut() else { return err("no controller") };
@@ -247,7 +247,7 @@ pub unsafe extern "C" fn emu_gps_route(p: *const u8, n: usize, speed: f64, hold:
             Some(g) => g.reroute(wp, Some(speed)),
             None => { let mut g = w53ga_emu::gnss::Gnss::new(wp, speed); g.start_after = c.now() + (P0_HZ / 10.0) as u64; c.gnss = Some(g); }
         }
-        if let Some(g) = c.gnss.as_mut() { g.hold_at_end = hold != 0; }
+        if let Some(g) = c.gnss.as_mut() { g.hold_at_end = hold != 0; g.altitudes = alts; }
         0
     }).unwrap_or_else(|| err("no state loaded"))
 }
@@ -255,6 +255,11 @@ pub unsafe extern "C" fn emu_gps_route(p: *const u8, n: usize, speed: f64, hold:
 /// Change the GPS speed (km/h) without moving the vehicle.
 #[no_mangle]
 pub extern "C" fn emu_gps_speed(speed: f64) { with(|e| if let Some(g) = e.m.board.companion.as_mut().and_then(|c| c.gnss.as_mut()) { g.speed_kmh = speed.max(0.0); }); }
+
+/// Block (1) or clear (0) the GPS sky, like driving into and out of a tunnel: the receiver reports no fix while the
+/// vehicle drives on along the route.
+#[no_mangle]
+pub extern "C" fn emu_gps_cut(on: i32) { with(|e| if let Some(g) = e.m.board.companion.as_mut().and_then(|c| c.gnss.as_mut()) { g.cut = on != 0; }); }
 
 /// Plug the OBD-II adapter / drive recorder in or out.
 #[no_mangle]
@@ -331,7 +336,9 @@ pub extern "C" fn emu_audio() -> usize {
 pub extern "C" fn emu_status() -> usize {
     let s = with(|e| {
         let m = &e.m;
-        let gps = m.board.companion.as_ref().and_then(|c| c.gnss.as_ref()).map(|g| { let f = g.current(); serde_json::json!({"lat": f.lat, "lon": f.lon, "speed": g.speed_kmh, "heading": f.heading}) });
+        let t = m.steps as f64 / P0_HZ;
+        let gps = m.board.companion.as_ref().and_then(|c| c.gnss.as_ref()).map(|g| { let f = g.current(); serde_json::json!({"lat": f.lat, "lon": f.lon, "speed": g.speed_kmh, "heading": f.heading,
+            "actual": f.speed_kmh, "cut": g.sky_blocked(t), "fix": g.has_fix(t)}) });
         let obd = m.board.obd2.as_ref().map(|o| serde_json::json!({"streaming": o.streaming, "rpm": o.car.rpm, "speed": o.car.speed_kmh}));
         let wifi = m.board.sdhi1.card.as_ref().map(|w| serde_json::json!({"connected": w.connected.map(|i| w.aps[i].ssid.clone()), "frames": w.frames_in + w.frames_out}));
         let sd_written = m.board.sdhi.as_ref().map_or(0, |s| s.card.overlay.len());

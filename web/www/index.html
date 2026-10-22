@@ -69,7 +69,7 @@
           <div class="fkeys">
             <button data-k="16" title="F1">0x10</button><button data-k="17" title="F2">0x11</button><button data-k="18" title="F3">0x12</button><button data-k="100" title="F4">0x64</button><button data-k="255" title="F5">0xFF</button>
           </div>
-          <p class="hint">Keyboard: <kbd>←</kbd><kbd>↑</kbd><kbd>↓</kbd><kbd>→</kbd> <kbd>Enter</kbd> ENT, <kbd>Backspace</kbd> BACK, <kbd>F1</kbd>–<kbd>F5</kbd> the other buttons, <kbd>P</kbd> pause, <kbd>S</kbd> screenshot.</p>
+          <p class="hint">Keyboard: <kbd>←</kbd><kbd>↑</kbd><kbd>↓</kbd><kbd>→</kbd> <kbd>Enter</kbd> ENT, <kbd>Backspace</kbd> BACK, <kbd>F1</kbd>–<kbd>F5</kbd> the other buttons, <kbd>P</kbd> pause, <kbd>S</kbd> screenshot, <kbd>T</kbd> tunnel (GPS off).</p>
         </div>
       </div>
     </section>
@@ -173,6 +173,10 @@
         <div id="map" hidden></div>
       </div>
       <div class="row speedrow"><label for="gps-speed">Speed</label><input id="gps-speed" type="range" min="0" max="180" value="40"><output id="gps-speed-v">40 km/h</output></div>
+      <div class="row tunnelrow">
+        <button id="gps-cut" aria-pressed="false" title="Block the GPS sky like a tunnel: the receiver reports no fix while the car drives on along the route (key T)">Enter tunnel</button>
+        <span class="note" id="gps-cut-note">GPS sky clear</span>
+      </div>
     </section>
 
     <details class="card obd" aria-label="OBD-II values">

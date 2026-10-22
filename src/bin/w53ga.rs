@@ -127,6 +127,7 @@ fn main() {
             last_title = Instant::now(); title_steps = m.steps; title_t = Instant::now();
         }
     }
+    w53ga_emu::machine::mmio_log_flush();
     // What the software wrote to the SD card goes back to the SD folder (--sd-readonly: never).
     w53ga_emu::sdsync::sync_and_report(m.board.sdhi.as_mut().map(|s| &mut s.card));
     if let Some(p) = opt("--save-flash") {

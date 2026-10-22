@@ -17,7 +17,8 @@
 *.bmp
 *.wav
 # Optional build-time input the repository does not ship (see README, "HLE profiles").
-/profiles/
+/profiles/*
+!/profiles/README.md
 /states/
 /dumps/
 /flash/

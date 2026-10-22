@@ -12,7 +12,7 @@ use w53ga_emu::session::{Options, OPTIONS_HELP};
 const P0_HZ: f64 = 100.0e6 / 3.0;
 
 fn usage() -> ! {
-    eprintln!("usage: w53ga-headless --flash FLASH.bin (--rl78 CONTROLLER.bin | --state SAVED.state) --seconds S [options]\n\n{OPTIONS_HELP}\n  --seconds S             emulated time to run (default 10)\n  --frame FILE.bmp        write the screen at the end (landscape, as the unit shows it)\n  --every S               with --frame: also write FILE-<t>.bmp every S emulated seconds\n  --ir CODE@S,...         remote presses: command code (hex) at emulated second S, e.g. 09@60,01@62\n  --save-state FILE       save the machine at the end (contains the flash image and RAM: keep it private)\n  --wav FILE              record the audio output\n  --dump-mem ADDR,LEN,FILE  write main-CPU memory (hex address and length) at the end\n  --save-flash FILE       write the NOR flash as it is at the end\n\nProfile writer (checks computed from the flash image; addresses in hex):\n  w53ga-headless --flash FLASH.bin --make-profile OUT.json --name NAME [--idle ADDR] [--rgah FILL,DRAW,BLT,BLTFC,FINISH]");
+    eprintln!("usage: w53ga-headless --flash FLASH.bin (--rl78 CONTROLLER.bin | --state SAVED.state) --seconds S [options]\n\n{OPTIONS_HELP}\n  --seconds S             emulated time to run (default 10)\n  --frame FILE.bmp        write the screen at the end (landscape, as the unit shows it)\n  --every S               with --frame: also write FILE-<t>.bmp every S emulated seconds\n  --ir CODE@S,...         remote presses: command code (hex) at emulated second S, e.g. 09@60,01@62\n  --save-state FILE       save the machine at the end (contains the flash image and RAM: keep it private)\n  --wav FILE              record the audio output\n  --dump-mem ADDR,LEN,FILE  write main-CPU memory (hex address and length) at the end\n  --save-flash FILE       write the NOR flash as it is at the end\n  --dump-rspi FILE        write the bytes sent on RSPI0 and RSPI1 (hex, one line per channel), e.g. the panel set-up\n  --dump-vdc FILE         write every VDC4 register (address, name, shadow and active value) at the end\n\nDiagnostics (environment): AR_MMIO_LOG=FILE logs every MMIO store; AR_LINK_LOG=1 (or full) logs the controller link.\n\nProfile writer (checks computed from the flash image; addresses in hex):\n  w53ga-headless --flash FLASH.bin --make-profile OUT.json --name NAME [--idle ADDR] [--rgah FILL,DRAW,BLT,BLTFC,FINISH]");
     std::process::exit(2)
 }
 
@@ -86,6 +86,7 @@ fn main() {
         }
     }
     let secs = t0.elapsed().as_secs_f64();
+    w53ga_emu::machine::mmio_log_flush();
     let done = (m.steps - start) as f64 / P0_HZ;
     println!("ran {done:.2} s of emulated time in {secs:.2} s ({:.2}x real time), {} interrupts", done / secs.max(1e-9), m.interrupts);
     if let Err(e) = &result { println!("STOPPED at t={:.3}s pc {:08x}: {e:?}\n  recent:{}", m.steps as f64 / P0_HZ, m.cpu.pc, m.dump_history()); }
@@ -110,6 +111,14 @@ fn main() {
                 _ => println!("--dump-mem ADDR,LEN,FILE (hex)"),
             }
         }
+    }
+    if let Some(p) = opt("--dump-rspi") {
+        let txt: String = (0..2).map(|c| format!("{c}: {}\n", m.board.rspi_tx[c].iter().map(|b| format!("{b:02x}")).collect::<String>())).collect();
+        match std::fs::write(&p, txt) { Ok(()) => println!("RSPI transmit log written to {p} ({} / {} bytes)", m.board.rspi_tx[0].len(), m.board.rspi_tx[1].len()), Err(e) => println!("{p}: {e}") }
+    }
+    if let (Some(p), Some(d)) = (opt("--dump-vdc"), &m.board.display) {
+        let txt: String = d.vdc.regs.iter().map(|r| format!("{:08x} {:<12} {:<8} shadow {:08x} active {:08x}\n", r.address, r.name, r.group, r.shadow, r.active)).collect();
+        match std::fs::write(&p, txt) { Ok(()) => println!("VDC4 registers written to {p}"), Err(e) => println!("{p}: {e}") }
     }
     if let Some(p) = opt("--save-flash") { match std::fs::write(&p, &m.cpu.mem.flash) { Ok(()) => println!("flash image written to {p}"), Err(e) => println!("{p}: {e}") } }
     if let (Some(path), Some(s)) = (&wav, &m.board.ssi) {

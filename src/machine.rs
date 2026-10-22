@@ -25,6 +25,7 @@ impl Mmio for Board {
     fn write(&mut self, pc: u32, a: u32, n: usize, v: u64) {
         self.irq_dirty = true;
         self.mmio_accesses += 1;
+        mmio_log(self.now, pc, a, n, v);
         if !Board::write(self, a, n, v) {
             // Unmodelled register: the store is accepted and remembered, nothing else happens.
             if self.observed.insert((a, n), v).is_none() { eprintln!("[mmio] unmodelled write {a:08x}/{n} = {v:x} at pc {pc:08x} (observed)"); }
@@ -33,6 +34,24 @@ impl Mmio for Board {
     fn ibnr(&mut self) -> u16 { self.latches.value(IBNR) as u16 }
     fn set_ibnr(&mut self, v: u16) { self.latches.set(IBNR, v as u64); }
     fn flash_cmd_mode(&self) -> bool { self.nor.in_command_mode() }
+}
+
+/// Diagnostics: AR_MMIO_LOG=FILE writes every MMIO store as "P0-time pc W addr/size value" (a program's register
+/// set-up sequences, e.g. to study how it drives the hardware). Off unless the variable is set.
+fn mmio_log_file() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::File>>> {
+    static LOG: std::sync::OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> = std::sync::OnceLock::new();
+    LOG.get_or_init(|| std::env::var_os("AR_MMIO_LOG").and_then(|p| std::fs::File::create(p).ok()).map(|f| std::sync::Mutex::new(std::io::BufWriter::new(f)))).as_ref()
+}
+
+fn mmio_log(now: u64, pc: u32, a: u32, n: usize, v: u64) {
+    use std::io::Write;
+    if let Some(Ok(mut w)) = mmio_log_file().map(|l| l.lock()) { let _ = writeln!(w, "{now} {pc:08x} W {a:08x}/{n} {v:x}"); }
+}
+
+/// Flush the AR_MMIO_LOG file (it is buffered); front ends call this before they exit.
+pub fn mmio_log_flush() {
+    use std::io::Write;
+    if let Some(Ok(mut w)) = mmio_log_file().map(|l| l.lock()) { let _ = w.flush(); }
 }
 
 fn one() -> u32 { 1 }

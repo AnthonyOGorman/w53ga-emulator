@@ -150,8 +150,8 @@ What was seen:
   (streets) and 8.5 s (expressway).
 - **G-sensor speed without OBD-II**: 79-82 km/h at a true 80, 50-52 km/h at a true 50.
 - **Old stationary sensor**: parking flag set all the time; the gyro course stayed at its value from the cut's start,
-  so every turn was missed. Without OBD-II the dead-reckoned speed was 0: the map stood still, the speed display fell
-  to 0 and then "- - -".
+  so every turn was missed. Without OBD-II the dead-reckoned speed was 0: the map stood still for the whole 70 s cut
+  (the speed read 46 km/h 2 s in, then "- - -") and jumped about 700 m when the fix returned.
 - **Night colours**: as described above, at 12:02:00 on the GPS clock in every run with a cut.
 - **Tunnel guidance**: none was shown or heard, also with the controller's warning database
   (`--rl78-spi` with a provisioned database). The two tunnels on the street route are under 1 km, and the expressway

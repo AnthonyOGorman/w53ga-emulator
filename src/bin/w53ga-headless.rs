@@ -93,6 +93,7 @@ fn main() {
     if std::env::var_os("W53GA_SPIN_STATS").is_some() {
         let (tries, found, skipped) = m.spin_stats();
         println!("busy-wait loops: {found} fast-forwarded ({tries} attempts), {skipped} instructions not executed; idle loop: {:.1}% of the time", 100.0 * m.idle_skipped as f64 / (m.steps - start).max(1) as f64);
+        if let Some(c) = &m.board.companion { let (t, f, s) = c.spin_stats(); println!("controller busy-wait loops: {f} fast-forwarded ({t} attempts), {s} instructions not executed"); }
     }
     if m.gfx_hle && m.hooks.rgah_range.is_some() { println!("2D graphics: {} fills, {} images, {} blits, {} masked, {} pixels", m.gfx.fills, m.gfx.images, m.gfx.blits, m.gfx.masks, m.gfx.pixels); }
     if let Some(f) = m.detected() {

@@ -47,7 +47,16 @@ pub struct Rl78 {
     /// fCLK cycles taken by the last instruction (RL78-S3 timing: branches, calls, returns and divides cost more).
     #[serde(skip)]
     pub cycles: u32,
+    /// Store check for the busy-wait fast-forward (`Companion::spin_record`): while on, a store that changes RAM sets
+    /// `wnoisy`.
+    #[serde(skip)]
+    pub(crate) wcheck: bool,
+    #[serde(skip)]
+    pub(crate) wnoisy: bool,
 }
+
+/// RAM offset of the general-register banks (FFEE0-FFEFF).
+const REGS_OFF: usize = (0xFFEE0 - RAM_BASE) as usize;
 
 const RAM_BASE: u32 = 0xF7F00;
 const RAM_END: u32 = 0xFFF00;
@@ -57,7 +66,7 @@ type R<T> = Result<T, Rl78Fault>;
 impl Rl78 {
     pub fn new(flash: Vec<u8>) -> Rl78 {
         let mut c = Rl78 { flash, data_flash: vec![0xFF; 0x2000], ram: vec![0; (RAM_END - RAM_BASE) as usize], pc: 0, halted: false, stopped: false,
-            es_prefix: false, steps: 0, cur_pc: 0, regs_hi: [0; 8], cycles: 1 };
+            es_prefix: false, steps: 0, cur_pc: 0, regs_hi: [0; 8], cycles: 1, wcheck: false, wnoisy: false };
         c.regs_hi[2] = 0x06; // PSW after reset: ISP = 3
         c.regs_hi[5] = 0x0F; // ES after reset
         c.pc = c.flash_word(0) as u32;
@@ -83,7 +92,12 @@ impl Rl78 {
     #[inline(always)]
     pub fn write8<B: Rl78Bus>(&mut self, bus: &mut B, a: u32, v: u8) -> R<()> {
         let a = a & 0xFFFFF;
-        if (RAM_BASE..0xFFF00).contains(&a) { self.ram[(a - RAM_BASE) as usize] = v; return Ok(()); }
+        if (RAM_BASE..0xFFF00).contains(&a) {
+            let o = (a - RAM_BASE) as usize;
+            if self.wcheck && self.ram[o] != v { self.wnoisy = true; }
+            self.ram[o] = v;
+            return Ok(());
+        }
         match a {
             RAM_BASE..=0xFFEFF => self.ram[(a - RAM_BASE) as usize] = v,
             0xFFFF8..=0xFFFFF => { self.regs_hi[(a - 0xFFFF8) as usize] = if a == SPL { v & 0xFE } else { v }; }
@@ -96,6 +110,18 @@ impl Rl78 {
     pub fn read16<B: Rl78Bus>(&mut self, bus: &mut B, a: u32) -> u16 { let a = a & !1; (self.read8(bus, a) as u16) | ((self.read8(bus, a + 1) as u16) << 8) }
     #[inline(always)]
     pub fn write16<B: Rl78Bus>(&mut self, bus: &mut B, a: u32, v: u16) -> R<()> { let a = a & !1; self.write8(bus, a, v as u8)?; self.write8(bus, a + 1, (v >> 8) as u8) }
+
+    /// The register banks (FFEE0-FFEFF) and the registers at FFFF8-FFFFF (SP, PSW, CS, ES, PMC), for the busy-wait
+    /// fast-forward.
+    pub(crate) fn spin_regs(&self) -> ([u8; 32], [u8; 8]) {
+        let mut b = [0u8; 32];
+        b.copy_from_slice(&self.ram[REGS_OFF..REGS_OFF + 32]);
+        (b, self.regs_hi)
+    }
+    pub(crate) fn set_spin_regs(&mut self, banks: &[u8; 32], hi: &[u8; 8]) {
+        self.ram[REGS_OFF..REGS_OFF + 32].copy_from_slice(banks);
+        self.regs_hi = *hi;
+    }
 
     // ---------- registers ----------
     #[inline(always)]

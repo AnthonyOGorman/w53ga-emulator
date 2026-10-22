@@ -48,6 +48,11 @@ pub struct G13 {
     pub irq_count: [u64; IFN],
     /// Earliest cycle at which any timer fires (fast path for `tick`).
     next_event: u64,
+    /// SFR accesses by the CPU and interrupts accepted, for the busy-wait fast-forward (`Companion::spin_record`).
+    #[serde(skip)]
+    pub bus_accesses: u64,
+    #[serde(skip)]
+    pub accepted: u64,
 }
 
 /// Timer array unit: 8 channels; only the free-running interval/one-count behaviour is modelled.
@@ -74,7 +79,8 @@ const TAU_IRQ: [[usize; 8]; 2] = [[20, 21, 22, 23, 31, 32, 33, 34], [43, 44, 45,
 impl Default for G13 {
     fn default() -> Self {
         let mut g = G13 { reset_request: false, sfr: [0; 0x100], sfr2: vec![0; 0x800], log: BTreeMap::new(), logging: true, cycles: 0, watch: None, cur_pc: 0, pins: [0xFF; 16], tau: Default::default(), sau: Default::default(), spi: super::spiflash::SpiFlash::provisioned(), fsl_ram: vec![0; 0x800], boot_swap: 0, fsl_log: std::env::var_os("AR_FSL_LOG").is_some(),
-            irq_dirty: true, cached: None, adc_inputs: [(0x80u8, 1.05 / 3.3), (0x81u8, 1.45 / 3.3)].into_iter().collect(), adc_seen: Default::default(), irq_count: [0; IFN], next_event: u64::MAX };
+            irq_dirty: true, cached: None, adc_inputs: [(0x80u8, 1.05 / 3.3), (0x81u8, 1.45 / 3.3)].into_iter().collect(), adc_seen: Default::default(), irq_count: [0; IFN], next_event: u64::MAX,
+            bus_accesses: 0, accepted: 0 };
         // reset values: MK all ones, PR all ones
         for a in [0xE4, 0xE5, 0xE6, 0xE7, 0xD4, 0xD5, 0xD6, 0xE8, 0xE9, 0xEA, 0xEB, 0xEC, 0xED, 0xEE, 0xEF, 0xD8, 0xD9, 0xDA, 0xDC, 0xDD, 0xDE] { g.sfr[a] = 0xFF; }
         for a in 0x20..0x30 { g.sfr[a] = 0xFF; } // PMx
@@ -122,12 +128,26 @@ impl G13 {
                 self.irq_dirty = true;
                 // ISP afterwards enables only higher levels (level 0 stays nestable).
                 self.irq_count[n] += 1;
+                self.accepted += 1;
                 cpu.interrupt(self, 4 + 2 * n as u32, lvl.saturating_sub(1))?;
                 return Ok(true);
             }
         }
         Ok(false)
     }
+
+    /// Would `service` accept an interrupt before the next instruction (the same check, without accepting it)?
+    #[inline(always)]
+    pub fn interrupt_due(&mut self, cpu: &Rl78) -> bool {
+        if self.irq_dirty { self.cached = self.pending(); self.irq_dirty = false; }
+        matches!(self.cached, Some((_, lvl)) if cpu.ie() && lvl <= cpu.isp())
+    }
+
+    /// fCLK cycles until the next timer or serial event (`tick` processes events once `cycles` reaches it).
+    pub fn cycles_to_event(&self) -> u64 { self.next_event.saturating_sub(self.cycles) }
+
+    /// Advance time by `n` cycles that end before the next event (`cycles_to_event`): what `tick` does then.
+    pub fn add_cycles(&mut self, n: u64) { debug_assert!(self.cycles + n < self.next_event); self.cycles += n; }
 
     /// One CPU step with interrupt acceptance and high-level emulation of the boot-ROM flash entry (CALL !!EFFF8).
     /// The instruction's clock count is left in `cpu.cycles` (interrupt acceptance adds 9 clocks).
@@ -362,6 +382,7 @@ impl G13 {
 
 impl Rl78Bus for G13 {
     fn read(&mut self, a: u32) -> u8 {
+        self.bus_accesses += 1;
         if let Some((lo, hi)) = self.watch { if (lo..hi).contains(&a) { eprintln!("[rl78] {:05x}: read {a:05x}", self.cur_pc); } }
         if self.logging { self.log.entry(a).or_insert((0, 0, 0)).0 += 1; }
         match a {
@@ -383,6 +404,7 @@ impl Rl78Bus for G13 {
         self.cell(a).map_or(0xFF, |c| *c)
     }
     fn write(&mut self, a: u32, v: u8) {
+        self.bus_accesses += 1;
         if (0xFFFD0..=0xFFFEF).contains(&a) { self.irq_dirty = true; }
         if let Some((lo, hi)) = self.watch { if (lo..hi).contains(&a) { eprintln!("[rl78] {:05x}: write {a:05x} = {v:02x}", self.cur_pc); } }
         if self.logging { let e = self.log.entry(a).or_insert((0, 0, 0)); e.1 += 1; e.2 = v; }

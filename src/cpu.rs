@@ -146,25 +146,43 @@ impl Cpu {
     /// Data read. SDRAM and flash (array mode) are read directly; anything else goes through `Memory::read_plain`
     /// and then the MMIO bus, as before.
     #[inline(always)]
-    pub fn read<M: Mmio + ?Sized>(&mut self, io: &mut M, a: u32, n: usize) -> Result<u32, Fault> {
-        if a as usize & (n - 1) != 0 { return Err(Fault::Address { pc: self.cur_pc, addr: a, size: n, write: false }); }
-        let v = match self.mem.read_fast(a, n) {
-            Some(v) => v,
-            None => match self.mem.read_plain(a, n) { Some(v) => v as u32, None => { self.io_touched = true; io.read(self.cur_pc, a, n) as u32 } },
-        };
-        if let Some((s, e)) = self.watch { if a < e && a + n as u32 > s && self.watch_log.len() < 100_000 { self.watch_log.push((self.cur_pc, a, n, false, v)); } }
+    pub fn read(&mut self, io: &mut dyn Mmio, a: u32, n: usize) -> Result<u32, Fault> {
+        if a as usize & (n - 1) != 0 { return Err(self.misaligned(a, n, false)); }
+        let v = match self.mem.read_fast(a, n) { Some(v) => v, None => self.read_slow(io, a, n) };
+        if self.watch.is_some() { self.watched(a, n, false, v); }
         Ok(v)
     }
     #[inline(always)]
-    pub fn write<M: Mmio + ?Sized>(&mut self, io: &mut M, a: u32, n: usize, v: u32) -> Result<(), Fault> {
-        if a as usize & (n - 1) != 0 { return Err(Fault::Address { pc: self.cur_pc, addr: a, size: n, write: true }); }
-        if let Some((s, e)) = self.watch { if a < e && a + n as u32 > s && self.watch_log.len() < 100_000 { self.watch_log.push((self.cur_pc, a, n, true, v)); } }
-        if !self.mem.write_fast(a, n, v) && !self.mem.write_plain(a, n, v as u64) {
+    pub fn write(&mut self, io: &mut dyn Mmio, a: u32, n: usize, v: u32) -> Result<(), Fault> {
+        if a as usize & (n - 1) != 0 { return Err(self.misaligned(a, n, true)); }
+        if self.watch.is_some() { self.watched(a, n, true, v); }
+        if !self.mem.write_fast(a, n, v) { self.write_slow(io, a, n, v); }
+        Ok(())
+    }
+    /// Data read outside SDRAM and array-mode flash: other plain memory, else the MMIO bus.
+    #[cold]
+    #[inline(never)]
+    fn read_slow(&mut self, io: &mut dyn Mmio, a: u32, n: usize) -> u32 {
+        match self.mem.read_plain(a, n) { Some(v) => v as u32, None => { self.io_touched = true; io.read(self.cur_pc, a, n) as u32 } }
+    }
+    /// Data write outside SDRAM: other plain memory, else the MMIO bus (NOR flash commands included).
+    #[cold]
+    #[inline(never)]
+    fn write_slow(&mut self, io: &mut dyn Mmio, a: u32, n: usize, v: u32) {
+        if !self.mem.write_plain(a, n, v as u64) {
             self.io_touched = true;
             io.write(self.cur_pc, a, n, v as u64);
             if crate::periph::nor::Nor::handles(a) { self.mem.flash_cmd_mode = io.flash_cmd_mode(); }
         }
-        Ok(())
+    }
+    #[cold]
+    #[inline(never)]
+    fn misaligned(&self, a: u32, n: usize, write: bool) -> Fault { Fault::Address { pc: self.cur_pc, addr: a, size: n, write } }
+    /// Debug watchpoint (`watch`): log the access if it overlaps.
+    #[cold]
+    #[inline(never)]
+    fn watched(&mut self, a: u32, n: usize, write: bool, v: u32) {
+        if let Some((s, e)) = self.watch { if a < e && a + n as u32 > s && self.watch_log.len() < 100_000 { self.watch_log.push((self.cur_pc, a, n, write, v)); } }
     }
     #[inline(always)] fn r8(&mut self, io: &mut dyn Mmio, a: u32) -> Result<u32, Fault> { self.read(io, a, 1) }
     #[inline(always)] fn r16(&mut self, io: &mut dyn Mmio, a: u32) -> Result<u32, Fault> { self.read(io, a, 2) }
@@ -310,6 +328,7 @@ impl Cpu {
     pub fn code_may_have_changed(&mut self) { self.blocks.epoch = self.blocks.epoch.wrapping_add(1); }
 
     /// Execute the slot instruction of a delayed branch at `slot_pc`.
+    #[inline(always)]
     fn slot(&mut self, io: &mut dyn Mmio, slot_pc: u32) -> Result<(), Fault> {
         let op = self.fetch(slot_pc)?;
         self.cur_pc = slot_pc;
@@ -455,7 +474,9 @@ impl Cpu {
     #[inline] fn drf(&self, i: usize) -> f64 { f64::from_bits(((self.fr[i & 14] as u64) << 32) | self.fr[i | 1] as u64) }
     #[inline] fn set_drf(&mut self, i: usize, v: f64) { let b = v.to_bits(); self.fr[i & 14] = (b >> 32) as u32; self.fr[i | 1] = b as u32; }
 
-    fn fpu(&mut self, io: &mut dyn Mmio, op: u32, pc: u32, n: usize, m: usize) -> Result<(), Fault> {
+    /// FPU instruction `op` (1111nnnnmmmmxxxx) with low nibble `LO` (= op & 0xF; one handler per value).
+    #[inline(always)]
+    fn fpu<const LO: u32>(&mut self, io: &mut dyn Mmio, op: u32, pc: u32, n: usize, m: usize) -> Result<(), Fault> {
         // Ghidra 12.1.4 superh.sinc implements no PR=1 (double) arithmetic and no SZ=1 (FMOV.D) transfer: every
         // such encoding executes as its single-precision form ("TODO" entries). GhidraCompat reproduces that for
         // lockstep comparison only; FCNVSD/FCNVDS are implemented by Ghidra on DR registers regardless of PR.
@@ -465,7 +486,7 @@ impl Cpu {
         let rz = self.float_mode == FloatMode::Hardware && self.fpscr & 3 == 1;
         let dn = self.float_mode == FloatMode::Hardware && self.fpscr & FPSCR_DN != 0;
         let illegal = Fault::Illegal { pc, op };
-        match op & 0xF {
+        match LO {
             0x0..=0x3 => {
                 if pr {
                     let (a, b) = (fz64(self.drf(n), dn), fz64(self.drf(m), dn));
@@ -1029,7 +1050,22 @@ handlers! {
     op_mov_imm(c, io, op, s) { c.r[rn(op)] = sext8(op); }
 
     // ----- 1111 -----
-    op_fpu(c, io, op, s) { let pc = c.cur_pc; c.fpu(io, op, pc, rn(op), rm(op))?; }
+    op_fpu_0(c, io, op, s) { let pc = c.cur_pc; c.fpu::<0x0>(io, op, pc, rn(op), rm(op))?; }
+    op_fpu_1(c, io, op, s) { let pc = c.cur_pc; c.fpu::<0x1>(io, op, pc, rn(op), rm(op))?; }
+    op_fpu_2(c, io, op, s) { let pc = c.cur_pc; c.fpu::<0x2>(io, op, pc, rn(op), rm(op))?; }
+    op_fpu_3(c, io, op, s) { let pc = c.cur_pc; c.fpu::<0x3>(io, op, pc, rn(op), rm(op))?; }
+    op_fpu_4(c, io, op, s) { let pc = c.cur_pc; c.fpu::<0x4>(io, op, pc, rn(op), rm(op))?; }
+    op_fpu_5(c, io, op, s) { let pc = c.cur_pc; c.fpu::<0x5>(io, op, pc, rn(op), rm(op))?; }
+    op_fpu_6(c, io, op, s) { let pc = c.cur_pc; c.fpu::<0x6>(io, op, pc, rn(op), rm(op))?; }
+    op_fpu_7(c, io, op, s) { let pc = c.cur_pc; c.fpu::<0x7>(io, op, pc, rn(op), rm(op))?; }
+    op_fpu_8(c, io, op, s) { let pc = c.cur_pc; c.fpu::<0x8>(io, op, pc, rn(op), rm(op))?; }
+    op_fpu_9(c, io, op, s) { let pc = c.cur_pc; c.fpu::<0x9>(io, op, pc, rn(op), rm(op))?; }
+    op_fpu_a(c, io, op, s) { let pc = c.cur_pc; c.fpu::<0xA>(io, op, pc, rn(op), rm(op))?; }
+    op_fpu_b(c, io, op, s) { let pc = c.cur_pc; c.fpu::<0xB>(io, op, pc, rn(op), rm(op))?; }
+    op_fpu_c(c, io, op, s) { let pc = c.cur_pc; c.fpu::<0xC>(io, op, pc, rn(op), rm(op))?; }
+    op_fpu_d(c, io, op, s) { let pc = c.cur_pc; c.fpu::<0xD>(io, op, pc, rn(op), rm(op))?; }
+    op_fpu_e(c, io, op, s) { let pc = c.cur_pc; c.fpu::<0xE>(io, op, pc, rn(op), rm(op))?; }
+    op_fpu_f(c, io, op, s) { let pc = c.cur_pc; c.fpu::<0xF>(io, op, pc, rn(op), rm(op))?; }
 }
 
 /// The handler of an opcode: the structure of the former `exec` match, arm by arm.
@@ -1117,7 +1153,11 @@ const fn decode(op: u32) -> K {
         },
         0xD => K::op_movl_pc,
         0xE => K::op_mov_imm,
-        _ => K::op_fpu,
+        _ => match op & 0xF {
+            0x0 => K::op_fpu_0, 0x1 => K::op_fpu_1, 0x2 => K::op_fpu_2, 0x3 => K::op_fpu_3, 0x4 => K::op_fpu_4, 0x5 => K::op_fpu_5,
+            0x6 => K::op_fpu_6, 0x7 => K::op_fpu_7, 0x8 => K::op_fpu_8, 0x9 => K::op_fpu_9, 0xA => K::op_fpu_a, 0xB => K::op_fpu_b,
+            0xC => K::op_fpu_c, 0xD => K::op_fpu_d, 0xE => K::op_fpu_e, _ => K::op_fpu_f,
+        },
     }
 }
 

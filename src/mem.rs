@@ -88,11 +88,15 @@ impl Memory {
     /// array mode. None: not one of those (use `read_plain`).
     #[inline(always)]
     pub fn read_fast(&self, a: u32, n: usize) -> Option<u32> {
-        let o = (a & 0xDFFF_FFFF).wrapping_sub(SDRAM_BASE) as usize;
-        let s = if o < SDRAM_SIZE { &self.sdram[o..] }
-            else if a & 0xDFFF_FFFF < FLASH_SIZE as u32 && !self.flash_cmd_mode { &self.flash[(a & 0x01FF_FFFF) as usize..] }
+        let a = a & 0xDFFF_FFFF;
+        let (m, o) = if a.wrapping_sub(SDRAM_BASE) < SDRAM_SIZE as u32 { (&self.sdram, (a - SDRAM_BASE) as usize) }
+            else if a < FLASH_SIZE as u32 && !self.flash_cmd_mode { (&self.flash, a as usize) }
             else { return None };
-        Some(match n { 1 => s[0] as u32, 2 => u16::from_be_bytes([s[0], s[1]]) as u32, _ => u32::from_be_bytes([s[0], s[1], s[2], s[3]]) })
+        Some(match n {
+            1 => *m.get(o)? as u32,
+            2 => u16::from_be_bytes(m.get(o..o + 2)?.try_into().ok()?) as u32,
+            _ => u32::from_be_bytes(m.get(o..o + 4)?.try_into().ok()?),
+        })
     }
 
     /// Data write fast path for an aligned 1-, 2- or 4-byte access to SDRAM (either mirror). False: not SDRAM (use
@@ -101,15 +105,15 @@ impl Memory {
     pub fn write_fast(&mut self, a: u32, n: usize, v: u32) -> bool {
         let o = (a & 0xDFFF_FFFF).wrapping_sub(SDRAM_BASE) as usize;
         if o >= SDRAM_SIZE { return false; }
-        let s = &mut self.sdram[o..];
-        match n { 1 => s[0] = v as u8, 2 => s[..2].copy_from_slice(&(v as u16).to_be_bytes()), _ => s[..4].copy_from_slice(&v.to_be_bytes()) }
+        let Some(s) = self.sdram.get_mut(o..o + n) else { return false };
+        match n { 1 => s[0] = v as u8, 2 => s.copy_from_slice(&(v as u16).to_be_bytes()), _ => s.copy_from_slice(&v.to_be_bytes()) }
         true
     }
 
     /// Instruction fetch fast path (flash and on-chip RAM), falling back to the general lookup.
     #[inline(always)]
     pub fn fetch16(&self, a: u32) -> Option<u16> {
-        if a < 0x0200_0000 { let i = a as usize; return Some(u16::from_be_bytes([self.flash[i], self.flash[i + 1]])); }
+        if a < 0x0200_0000 { if let Some(b) = self.flash.get(a as usize..a as usize + 2) { return Some(u16::from_be_bytes([b[0], b[1]])); } }
         self.read_plain(a, 2).map(|v| v as u16)
     }
 

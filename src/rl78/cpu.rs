@@ -214,6 +214,7 @@ impl Rl78 {
     }
 
     // ---------- execution ----------
+    #[inline(always)]
     pub fn step<B: Rl78Bus>(&mut self, bus: &mut B) -> R<()> {
         self.steps += 1;
         self.cycles = 1;
@@ -240,6 +241,7 @@ impl Rl78 {
         Ok(())
     }
 
+    #[inline(always)]
     fn exec<B: Rl78Bus>(&mut self, bus: &mut B, op: u8) -> R<()> {
         let lo = op & 0x0F;
         let hi = op >> 4;

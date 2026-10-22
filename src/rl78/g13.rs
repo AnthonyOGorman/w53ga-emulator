@@ -111,6 +111,7 @@ impl G13 {
     }
 
     /// Accept an interrupt if allowed (IE set and level higher priority than ISP).
+    #[inline(always)]
     pub fn service(&mut self, cpu: &mut Rl78) -> Result<bool, Rl78Fault> {
         if self.irq_dirty { self.cached = self.pending(); self.irq_dirty = false; }
         if let Some((n, lvl)) = self.cached {
@@ -130,6 +131,7 @@ impl G13 {
 
     /// One CPU step with interrupt acceptance and high-level emulation of the boot-ROM flash entry (CALL !!EFFF8).
     /// The instruction's clock count is left in `cpu.cycles` (interrupt acceptance adds 9 clocks).
+    #[inline(always)]
     pub fn step(&mut self, cpu: &mut Rl78) -> Result<(), Rl78Fault> {
         if self.service(cpu)? { cpu.steps += 1; cpu.cycles = 9; return Ok(()); }
         match cpu.step(self) {
@@ -319,9 +321,16 @@ impl G13 {
     }
 
     /// Advance peripheral time by `n` fCLK cycles.
+    #[inline(always)]
     pub fn tick(&mut self, n: u64) {
         self.cycles += n;
         if self.cycles < self.next_event { return; }
+        self.tick_events();
+    }
+
+    /// Timer and serial events now due (`tick`).
+    #[inline(never)]
+    fn tick_events(&mut self) {
         for u in 0..2 {
             for ch in 0..8 {
                 while let Some(d) = self.tau[u].due[ch] {

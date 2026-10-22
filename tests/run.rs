@@ -87,11 +87,14 @@ fn run_is_step_by_step_even_when_flash_changes() {
 const COUNTER: u32 = 0x1C00_0200;
 const SCRATCH: u32 = 0x1C00_0300;
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Wait { Irq, Noisy, Poll }
+
 /// A program that waits in a loop for a timer interrupt (CMT0, every 201 x 8 P0 clocks) to change a counter in RAM,
 /// then counts the change and waits again. The loop pushes and pops PR (a store that writes what is already there
-/// once the loop runs). With `noisy`, the loop also increments a word in RAM each pass (registers still repeat): it must
-/// not be fast-forwarded.
-fn waiting_image(noisy: bool) -> Vec<u8> {
+/// once the loop runs). `Noisy`: the loop also increments a word in RAM each pass (registers still repeat), so it must
+/// not be fast-forwarded. `Poll`: no interrupt; the loop polls CMCSR0 for the compare-match flag and clears it.
+fn waiting_image(mode: Wait) -> Vec<u8> {
     let mut f = vec![0u8; FLASH_SIZE];
     let lit = 0x1100;
     let mut code: Vec<(u32, u16)> = vec![
@@ -99,22 +102,23 @@ fn waiting_image(noisy: bool) -> Vec<u8> {
         (0x1000, movl_pc(0x1000, lit, 0)), (0x1002, 0x402E),
         (0x1004, movl_pc(0x1004, lit + 4, 1)), (0x1006, 0x6010), (0x1008, 0xC9FB), (0x100A, 0x2100),
         (0x100C, movl_pc(0x100C, lit + 8, 1)), (0x100E, movl_pc(0x100E, lit + 12, 0)), (0x1010, 0x2101),
-        (0x1012, movl_pc(0x1012, lit + 16, 1)), (0x1014, 0xE040), (0x1016, 0x2101),
+        (0x1012, movl_pc(0x1012, lit + 16, 1)), (0x1014, if mode == Wait::Poll { 0xE000 } else { 0xE040 }), (0x1016, 0x2101),
         (0x1018, movl_pc(0x1018, lit + 20, 1)), (0x101A, movl_pc(0x101A, lit + 24, 0)), (0x101C, 0x2101),
         (0x101E, movl_pc(0x101E, lit + 28, 1)), (0x1020, 0xE001), (0x1022, 0x2101),
-        // r8 = &COUNTER, r9 = last value seen, r10 = changes seen, r12 = &SCRATCH; SR.IMASK = 0
+        // r8 = &COUNTER, r9 = last value seen, r10 = changes seen, r12 = &SCRATCH (Poll: &CMCSR0); SR.IMASK = 0
         (0x1024, movl_pc(0x1024, lit + 32, 8)), (0x1026, 0xE900), (0x1028, 0xEA00), (0x102A, movl_pc(0x102A, lit + 36, 12)),
         (0x102C, 0xE000), (0x102E, 0x400E),
         // ISR: clear CMF (read, then write 0x40), COUNTER += 1, RESBANK, RTE
         (0x1400, movl_pc(0x1400, 0x1420, 1)), (0x1402, 0x6011), (0x1404, 0xE040), (0x1406, 0x2101),
         (0x1408, movl_pc(0x1408, 0x1424, 1)), (0x140A, 0x6012), (0x140C, 0x7001), (0x140E, 0x2102), (0x1410, 0x005B), (0x1412, 0x002B), (0x1414, 0x0009),
     ];
-    let wait = if noisy {
+    let wait = match mode {
         // L: sts.l pr,@-r15; lds.l @r15+,pr; mov.l @r12,r3; add #1,r3; mov.l r3,@r12; mov #0,r3; mov.l @r8,r2; cmp/eq r9,r2; bt L
-        vec![0x4F22, 0x4F26, 0x63C2, 0x7301, 0x2C32, 0xE300, 0x6282, 0x3290, 0x89F6]
-    } else {
+        Wait::Noisy => vec![0x4F22, 0x4F26, 0x63C2, 0x7301, 0x2C32, 0xE300, 0x6282, 0x3290, 0x89F6],
         // L: sts.l pr,@-r15; lds.l @r15+,pr; mov.l @r8,r2; cmp/eq r9,r2; bt L
-        vec![0x4F22, 0x4F26, 0x6282, 0x3290, 0x89FA]
+        Wait::Irq => vec![0x4F22, 0x4F26, 0x6282, 0x3290, 0x89FA],
+        // L: mov.w @r12,r0; tst #0x80,r0; bt L; mov #0,r0; mov.w r0,@r12 (CMF read as 1, then written 0: cleared)
+        Wait::Poll => vec![0x60C1, 0xC880, 0x89FC, 0xE000, 0x2C01],
     };
     let mut a = 0x1030;
     for w in &wait { code.push((a, *w)); a += 2; }
@@ -125,15 +129,16 @@ fn waiting_image(noisy: bool) -> Vec<u8> {
     let mut w32 = |a: u32, v: u32| f[a as usize..a as usize + 4].copy_from_slice(&v.to_be_bytes());
     w32(0, 0x1000);
     w32(4, 0x1C20_0000);
-    for (k, v) in [0x1800, 0xFFFE_0418, 0xFFFE_C006, 200, 0xFFFE_C002, 0xFFFE_0C0C, 0x7000, 0xFFFE_C000, COUNTER, SCRATCH].into_iter().enumerate() { w32(lit + 4 * k as u32, v); }
+    let r12 = if mode == Wait::Poll { 0xFFFE_C002 } else { SCRATCH };
+    for (k, v) in [0x1800, 0xFFFE_0418, 0xFFFE_C006, 200, 0xFFFE_C002, 0xFFFE_0C0C, 0x7000, 0xFFFE_C000, COUNTER, r12].into_iter().enumerate() { w32(lit + 4 * k as u32, v); }
     w32(0x1420, 0xFFFE_C002);
     w32(0x1424, COUNTER);
     w32(0x1800 + 188 * 4, 0x1400);
     f
 }
 
-fn waiting(noisy: bool) -> Machine {
-    let mut m = Machine::power_on(waiting_image(noisy)).expect("power on");
+fn waiting(mode: Wait) -> Machine {
+    let mut m = Machine::power_on(waiting_image(mode)).expect("power on");
     m.configure_realtime();
     m.disable_hle();
     m
@@ -141,8 +146,8 @@ fn waiting(noisy: bool) -> Machine {
 
 #[test]
 fn busy_wait_fast_forward_is_step_by_step() {
-    for noisy in [false, true] {
-        let (mut fast, mut slow) = (waiting(noisy), waiting(noisy));
+    for mode in [Wait::Irq, Wait::Noisy, Wait::Poll] {
+        let (mut fast, mut slow) = (waiting(mode), waiting(mode));
         let n = 32 * 4000;
         // in several runs, as a front end would call it
         for _ in 0..4 { fast.run(n / 4).expect("runs"); }
@@ -151,14 +156,19 @@ fn busy_wait_fast_forward_is_step_by_step() {
         assert_eq!((fast.interrupts, fast.cpu.cur_pc), (slow.interrupts, slow.cpu.cur_pc));
         assert_eq!(fast.cpu.mem.oram, slow.cpu.mem.oram);
         let seen = fast.cpu.r[10];
-        assert!(seen > 50, "the program saw {seen} timer interrupts");
+        assert!(seen > 50, "{mode:?}: the program saw {seen} timer events");
         assert_eq!(fast.cpu.mem.read_plain(COUNTER, 4), Some(fast.interrupts));
         let (_, found, skipped) = fast.spin_stats();
-        if noisy {
-            assert_eq!(found, 0, "a loop that changes memory is not fast-forwarded");
-            assert!(fast.cpu.mem.read_plain(SCRATCH, 4).unwrap() > 1000);
-        } else {
-            assert!(found > 40 && skipped > n * 4, "{found} loops fast-forwarded, {skipped} instructions skipped");
+        match mode {
+            Wait::Noisy => {
+                assert_eq!(found, 0, "a loop that changes memory is not fast-forwarded");
+                assert!(fast.cpu.mem.read_plain(SCRATCH, 4).unwrap() > 1000);
+            }
+            Wait::Poll => {
+                assert_eq!(fast.interrupts, 0);
+                assert!(found > 40 && skipped > n * 4, "{mode:?}: {found} loops fast-forwarded, {skipped} instructions skipped");
+            }
+            Wait::Irq => assert!(found > 40 && skipped > n * 4, "{mode:?}: {found} loops fast-forwarded, {skipped} instructions skipped"),
         }
     }
 }

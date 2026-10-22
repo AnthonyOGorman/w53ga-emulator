@@ -12,6 +12,7 @@ impl Mmio for Board {
     fn read(&mut self, pc: u32, a: u32, n: usize) -> u64 {
         self.irq_dirty = true;
         self.mmio_accesses += 1;
+        if let Some(l) = &mut self.spin_log { l.push((a, n, false)); }
         if crate::periph::nor::Nor::handles(a) {
             if let Some(v) = self.nor.mode_read(a) { return match n { 4 => ((v as u64) << 16) | v as u64, 1 => (v & 0xFF) as u64, _ => v as u64 }; }
         }
@@ -25,6 +26,7 @@ impl Mmio for Board {
     fn write(&mut self, pc: u32, a: u32, n: usize, v: u64) {
         self.irq_dirty = true;
         self.mmio_accesses += 1;
+        if let Some(l) = &mut self.spin_log { l.push((a, n, true)); }
         mmio_log(self.now, pc, a, n, v);
         if !Board::write(self, a, n, v) {
             // Unmodelled register: the store is accepted and remembered, nothing else happens.
@@ -523,13 +525,15 @@ impl Machine {
     // ---------- busy-wait loops ----------
     //
     // Programs often wait in a loop that only reads memory until an interrupt handler changes it (a tick counter, a
-    // receive ring, a flag). When one pass through such a loop leaves every CPU register as it found it and every
-    // store it makes writes the value already there, the next pass is the same computation on the same inputs, and so
-    // is every pass after it until something outside the CPU acts: an interrupt is accepted, or a device (DMA, the JPEG
-    // unit, the camera, NOR programming) writes memory. The loop touches no device itself. So between those events the
-    // CPU's state at any instruction count is known without executing anything: the peripherals are ticked as usual
-    // (exactly as `run_fast` would tick them, every `cpu_per_p0 * p0_batch` instructions), and when the fast-forward ends
-    // the CPU is put in the state it has at that point of the loop. The run is the same as executing every instruction.
+    // receive ring, a flag), or that polls a timer's status register until a compare match. When one pass through such
+    // a loop leaves every CPU register as it found it, every store it makes writes the value already there, and its
+    // only device accesses are reads of plain register latches (no device model involved, `Board::latch_only`), the
+    // next pass is the same computation on the same inputs, and so is every pass after it until something outside the
+    // CPU acts: an interrupt is accepted, a device (DMA, the JPEG unit, the camera, NOR programming) writes memory, or a
+    // tick changes one of the latches it reads. So between those events the CPU's state at any instruction count is
+    // known without executing anything: the peripherals are ticked as usual (exactly as `run_fast` would tick them,
+    // every `cpu_per_p0 * p0_batch` instructions), and when the fast-forward ends the CPU is put in the state it has at
+    // that point of the loop. The run is the same as executing every instruction.
 
     /// After a peripheral tick: look for a busy-wait loop from the current instruction, unless backing off after
     /// failed attempts. Instructions run through `step` meanwhile, so nothing is skipped while looking.
@@ -560,11 +564,17 @@ impl Machine {
         self.cpu.spin_safe(pc)
     }
 
-    /// One `step` while looking for a loop; false if it did anything a fast-forwarded loop may not do (a device access,
-    /// an interrupt, SLEEP) or a device wrote memory meanwhile (in a tick).
-    fn spin_step(&mut self, mark: &(u64, u64, u64, u64)) -> Result<bool, Stop> {
+    /// One `step` while looking for a loop, noting the latches it read in `reads`; false if it did anything a
+    /// fast-forwarded loop may not do (an access to a device model, any device write, an interrupt, SLEEP) or a device
+    /// wrote memory meanwhile (in a tick).
+    fn spin_step(&mut self, mark: &(u64, u64, u64), reads: &mut Vec<usize>) -> Result<bool, Stop> {
+        self.board.spin_log.get_or_insert_with(Vec::new).clear();
         self.step()?;
-        Ok(!self.cpu.sleeping && (self.interrupts, self.board.mmio_accesses, self.cpu.mem.ext_writes, self.cpu.mem.code_gen) == *mark)
+        if self.cpu.sleeping || (self.interrupts, self.cpu.mem.ext_writes, self.cpu.mem.code_gen) != *mark { return Ok(false); }
+        let log = self.board.spin_log.take().unwrap_or_default();
+        let ok = log.iter().all(|&(a, n, w)| match (w, self.board.latch_only(a, n)) { (false, Some(i)) => { reads.push(i); true } _ => false });
+        self.board.spin_log = Some(log);
+        Ok(ok)
     }
 
     /// Run on from the current instruction looking for a pass of at most `SPIN_MAX` steps that returns to the same
@@ -572,48 +582,68 @@ impl Machine {
     /// when the second pass also came back to the same registers, changed no memory (every store wrote the value
     /// already there) and kept SR.IMASK: the loop is then ready to be fast-forwarded from phase 0 (where the CPU is).
     fn spin_find(&mut self, end: u64) -> Result<bool, Stop> {
+        let r = self.spin_find_with(end);
+        self.board.spin_log = None;
+        self.cpu.set_store_check(false);
+        r
+    }
+
+    fn spin_find_with(&mut self, end: u64) -> Result<bool, Stop> {
         let s0 = SpinRegs::of(&self.cpu);
-        let mark = (self.interrupts, self.board.mmio_accesses, self.cpu.mem.ext_writes, self.cpu.mem.code_gen);
+        let mark = (self.interrupts, self.cpu.mem.ext_writes, self.cpu.mem.code_gen);
+        let mut reads = Vec::new();
         let mut k = 0;
         for i in 1..=SPIN_MAX {
-            if !self.spin_can_step(end) || !self.spin_step(&mark)? { return Ok(false); }
+            if !self.spin_can_step(end) || !self.spin_step(&mark, &mut reads)? { return Ok(false); }
             if self.cpu.pc == s0.pc && SpinRegs::of(&self.cpu) == s0 { k = i; break; }
         }
         if k == 0 { return Ok(false); }
         let mut states = std::mem::take(&mut self.spin.states);
         let mut cur = std::mem::take(&mut self.spin.cur);
-        states.clear();
-        cur.clear();
+        let mut pre = std::mem::take(&mut self.spin.pre);
+        (states.clear(), cur.clear(), pre.clear(), reads.clear());
+        pre.push(0);
         self.cpu.set_store_check(true);
         let mut ok = true;
         for _ in 0..k {
             if !self.spin_can_step(end) { ok = false; break; }
             states.push(SpinRegs::of(&self.cpu));
-            match self.spin_step(&mark) {
-                Ok(true) => cur.push(self.cpu.cur_pc),
-                Ok(false) => { ok = false; break; }
-                Err(e) => { self.cpu.set_store_check(false); return Err(e); }
-            }
+            if !self.spin_step(&mark, &mut reads)? { ok = false; break; }
+            cur.push(self.cpu.cur_pc);
+            pre.push(reads.len() as u64);
         }
         ok = ok && !self.cpu.wnoisy;
-        self.cpu.set_store_check(false);
         let imask = (s0.sr >> 4) & 15;
         ok = ok && SpinRegs::of(&self.cpu) == s0 && states.iter().all(|s| (s.sr >> 4) & 15 == imask);
         if ok {
             self.spin.phase = 0;
             self.spin.imask = imask;
-            self.spin.ext = mark.2;
-            self.spin.gen = mark.3;
+            self.spin.ext = mark.1;
+            self.spin.gen = mark.2;
+            // every latch the pass read has had all its reads' effects: further reads from these states change nothing
+            reads.sort_unstable();
+            reads.dedup();
+            self.spin.latches = reads.iter().map(|&i| (i, self.board.latch_state(i))).collect();
         }
         self.spin.states = states;
         self.spin.cur = cur;
+        self.spin.pre = pre;
         Ok(ok)
+    }
+
+    /// Latch reads by `n` passes' worth of steps of the loop from phase `p` (`Spin::pre`).
+    fn spin_reads(&self, p: usize, n: usize) -> u64 {
+        let pre = &self.spin.pre;
+        let k = pre.len() - 1;
+        let (laps, e) = ((n / k) as u64, p + n % k);
+        laps * pre[k] + if e <= k { pre[e] - pre[p] } else { pre[k] - pre[p] + pre[e - k] }
     }
 
     /// Fast-forward the verified loop: each tick's remaining instructions are passes (or parts of passes) through the
     /// loop, so only the peripherals are ticked, as `run_fast` would tick them after executing those instructions.
     /// Stops after the first tick at which the loop may no longer repeat (an interrupt it would accept, memory written
-    /// by a device, a reset or a model fault pending) or the run ends; the CPU then gets the state of that point.
+    /// by a device, a latch it reads changed, a reset or a model fault pending) or the run ends; the CPU then gets the
+    /// state of that point.
     fn spin_forward(&mut self, end: u64) -> Result<(), Stop> {
         let limit = (self.cpu_per_p0 * self.p0_batch) as usize;
         let k = self.spin.states.len();
@@ -626,6 +656,7 @@ impl Machine {
                 self.hist_irq[at] = false;
             }
             self.hist_pos += n;
+            self.board.mmio_accesses += self.spin_reads(self.spin.phase, n);
             self.spin.phase = (self.spin.phase + n) % k;
             self.spin.skipped += n as u64;
             self.sub = 0;
@@ -636,6 +667,7 @@ impl Machine {
             if let Some(f) = self.board.fault.take() { self.spin_stop(); return Err(Stop::Model(f)); }
             let imask = self.spin.imask;
             if self.steps >= end || self.board.wdt.reset.is_some() || self.cpu.mem.ext_writes != self.spin.ext || self.cpu.mem.code_gen != self.spin.gen
+                || self.spin.latches.iter().any(|&(i, s)| self.board.latch_state(i) != s)
                 || self.board.pending_request().is_some_and(|(_, l)| l > imask) {
                 self.spin_stop();
                 return Ok(());
@@ -750,6 +782,9 @@ struct Spin {
     /// One pass of the loop: the registers before each of its steps, and `cur_pc` after each.
     states: Vec<SpinRegs>,
     cur: Vec<u32>,
+    /// Latch reads before each step of the pass (prefix sums, `k + 1` entries), and the latches read with their state.
+    pre: Vec<u64>,
+    latches: Vec<(usize, (u64, u64, bool))>,
     /// Position in the pass (the next step), SR.IMASK throughout, and memory's device-write and code generations.
     phase: usize,
     imask: u32,

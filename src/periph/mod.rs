@@ -141,6 +141,10 @@ pub struct Board {
     /// Watchdog (only the boot loader starts it, to restart the unit after an update).
     #[serde(skip, default = "wdt::Wdt::power_on")]
     pub wdt: wdt::Wdt,
+    /// While the busy-wait fast-forward looks for a loop (`Machine::spin_find`): the CPU's MMIO accesses (address, size,
+    /// write).
+    #[serde(skip)]
+    pub spin_log: Option<Vec<(u32, usize, bool)>>,
 }
 
 /// Plain registers without behaviour the firmware relies on, at their reset values :
@@ -223,7 +227,7 @@ impl Board {
             src: { let mut s = Src::new(); if let Some(r) = &c.src { let _ = s.write(audio::SRC_BASE + 8, 2, r.input_control as u64); let _ = s.write(audio::SRC_BASE + 0xA, 2, r.output_control as u64); } s },
             ssi: Some(c.ssi.as_ref().map_or_else(|| Ssi::new(0, 0, 0, false), |t| Ssi::new(t.cr as u32, t.fcr as u32, t.clock.fifo.len(), t.clock.ten))),
             sdhi: None, sdhi1: SdhiEmpty::new(c.sdhi1.as_ref()), peer: subcpu::Peer::new(1), companion: None,
-            fault: None, observed: reset_register_file(), nor: nor::Nor::default(), irq_dirty: true, cached_request: None, rspi: [vec![0; 0x30], vec![0; 0x30]], rspi_tx: [Vec::new(), Vec::new()], obd2: None, dvr: None, camera: false, cam: Default::default(), vdec_free_run: false, gpu: Default::default(), mmio_accesses: 0, wdt: wdt::Wdt::power_on() })
+            fault: None, observed: reset_register_file(), nor: nor::Nor::default(), irq_dirty: true, cached_request: None, rspi: [vec![0; 0x30], vec![0; 0x30]], rspi_tx: [Vec::new(), Vec::new()], obd2: None, dvr: None, camera: false, cam: Default::default(), vdec_free_run: false, gpu: Default::default(), mmio_accesses: 0, wdt: wdt::Wdt::power_on(), spin_log: None })
     }
 
     /// Chip reset of the SH7269 (watchdog overflow): every on-chip peripheral returns to its power-on state (`c`, the
@@ -310,6 +314,27 @@ impl Board {
         if (ADC_BASE..ADC_BASE + 0x400).contains(&a) || (VDEC_BASE..VDEC_BASE + 0x300).contains(&a) { return true; }
         (cmt || intc) && self.latches.find(a, n).is_some()
     }
+
+    /// The register latch that alone answers a CPU read of `a`/`n`: no device model is involved (`read` would reach
+    /// the latch file), so the read's only effect is the latch's own read behaviour (status flags noted as read), which
+    /// a second read from the same latch state repeats exactly. None for anything else, and for GPIO data registers
+    /// (their value also depends on the direction latch). For the busy-wait fast-forward (`Machine::spin_find`).
+    pub fn latch_only(&self, a: u32, n: usize) -> Option<usize> {
+        if nor::Nor::handles(a) || (0xF000_0000..0xF200_0000).contains(&a) || rspi_reg(a).is_some() { return None; }
+        if self.display.is_some() && Vdc4::handles(a, n) { return None; }
+        if self.iic2.as_ref().is_some_and(|c| c.handles(a, n)) || self.iic1.as_ref().is_some_and(|c| c.handles(a, n)) { return None; }
+        if self.rtc.as_ref().is_some_and(|r| r.handles(a, n)) { return None; }
+        if [&self.scif7, &self.scif1, &self.scif6].iter().any(|s| s.as_ref().is_some_and(|s| s.handles(a, n))) { return None; }
+        if (self.sdhi.is_some() && Sdhi::handles(a, n)) || SdhiEmpty::handles(a, n) || Src::handles(a, n) || (self.ssi.is_some() && Ssi::handles(a, n)) { return None; }
+        if (self.jcu.is_some() && Jcu::handles(a, n)) || Dmac::handles(a, n) { return None; }
+        if (ADC_BASE..ADC_BASE + 0x400).contains(&a) || (VDEC_BASE..VDEC_BASE + 0x300).contains(&a) || wdt::Wdt::handles(a) || rgpvg::Rgpvg::handles(a) { return None; }
+        let i = self.latches.find(a, n)?;
+        if self.latches.regs[i].behavior == regs::Behavior::GpioData { return None; }
+        Some(i)
+    }
+
+    /// The state of latch `i` that its reads depend on or change (value, flags noted as read).
+    pub fn latch_state(&self, i: usize) -> (u64, u64, bool) { let r = &self.latches.regs[i]; (r.value, r.status_read, r.cmf_read) }
 
     pub fn read(&mut self, a: u32, n: usize) -> Option<u64> {
         // Memory-mapped cache address/data arrays: the emulator has no cache, so every line reads invalid (0).

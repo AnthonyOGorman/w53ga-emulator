@@ -63,10 +63,11 @@ impl Rl78 {
         c.pc = c.flash_word(0) as u32;
         c
     }
+    #[inline(always)]
     fn flash_word(&self, a: u32) -> u16 { u16::from_le_bytes([self.flash[a as usize], self.flash[a as usize + 1]]) }
 
     // ---------- memory ----------
-    #[inline]
+    #[inline(always)]
     pub fn read8<B: Rl78Bus>(&mut self, bus: &mut B, a: u32) -> u8 {
         let a = a & 0xFFFFF;
         if (RAM_BASE..0xFFF00).contains(&a) { return self.ram[(a - RAM_BASE) as usize]; }
@@ -79,7 +80,7 @@ impl Rl78 {
             _ => bus.read(a),
         }
     }
-    #[inline]
+    #[inline(always)]
     pub fn write8<B: Rl78Bus>(&mut self, bus: &mut B, a: u32, v: u8) -> R<()> {
         let a = a & 0xFFFFF;
         if (RAM_BASE..0xFFF00).contains(&a) { self.ram[(a - RAM_BASE) as usize] = v; return Ok(()); }
@@ -91,27 +92,45 @@ impl Rl78 {
         }
         Ok(())
     }
+    #[inline(always)]
     pub fn read16<B: Rl78Bus>(&mut self, bus: &mut B, a: u32) -> u16 { let a = a & !1; (self.read8(bus, a) as u16) | ((self.read8(bus, a + 1) as u16) << 8) }
+    #[inline(always)]
     pub fn write16<B: Rl78Bus>(&mut self, bus: &mut B, a: u32, v: u16) -> R<()> { let a = a & !1; self.write8(bus, a, v as u8)?; self.write8(bus, a + 1, (v >> 8) as u8) }
 
     // ---------- registers ----------
+    #[inline(always)]
     pub fn psw(&self) -> u8 { self.regs_hi[2] }
+    #[inline(always)]
     pub fn set_psw(&mut self, v: u8) { self.regs_hi[2] = v; }
+    #[inline(always)]
     pub fn sp(&self) -> u16 { u16::from_le_bytes([self.regs_hi[0], self.regs_hi[1]]) }
+    #[inline(always)]
     pub fn set_sp(&mut self, v: u16) { self.regs_hi[0] = v as u8 & 0xFE; self.regs_hi[1] = (v >> 8) as u8; }
+    #[inline(always)]
     pub fn cs(&self) -> u8 { self.regs_hi[4] & 0x0F }
+    #[inline(always)]
     pub fn es(&self) -> u8 { self.regs_hi[5] & 0x0F }
+    #[inline(always)]
     fn bank_base(&self) -> u32 { let p = self.psw(); let rb = ((p >> 4) & 2) | ((p >> 3) & 1); 0xFFEF8 - 8 * rb as u32 }
     /// r: 0 X, 1 A, 2 C, 3 B, 4 E, 5 D, 6 L, 7 H.
+    #[inline(always)]
     pub fn r(&self, i: usize) -> u8 { self.ram[(self.bank_base() - RAM_BASE) as usize + i] }
+    #[inline(always)]
     pub fn set_r(&mut self, i: usize, v: u8) { let o = (self.bank_base() - RAM_BASE) as usize + i; self.ram[o] = v; }
     /// rp: 0 AX, 1 BC, 2 DE, 3 HL.
+    #[inline(always)]
     pub fn rp(&self, i: usize) -> u16 { (self.r(2 * i) as u16) | ((self.r(2 * i + 1) as u16) << 8) }
+    #[inline(always)]
     pub fn set_rp(&mut self, i: usize, v: u16) { self.set_r(2 * i, v as u8); self.set_r(2 * i + 1, (v >> 8) as u8); }
+    #[inline(always)]
     fn a(&self) -> u8 { self.r(1) }
+    #[inline(always)]
     fn set_a(&mut self, v: u8) { self.set_r(1, v) }
+    #[inline(always)]
     fn cy(&self) -> bool { self.psw() & PSW_CY != 0 }
+    #[inline(always)]
     fn z(&self) -> bool { self.psw() & PSW_Z != 0 }
+    #[inline(always)]
     fn set_flag(&mut self, f: u8, on: bool) { let p = self.psw(); self.set_psw(if on { p | f } else { p & !f }); }
 
     // ---------- fetch ----------
@@ -123,18 +142,27 @@ impl Rl78 {
         self.pc = (self.pc + 1) & 0xFFFFF;
         Ok(v)
     }
+    #[inline(always)]
     fn fetch16<B: Rl78Bus>(&mut self, bus: &mut B) -> R<u16> { let l = self.fetch(bus)? as u16; Ok(l | ((self.fetch(bus)? as u16) << 8)) }
 
     // ---------- effective addresses ----------
+    #[inline(always)]
     fn base(&self) -> u32 { if self.es_prefix { (self.es() as u32) << 16 } else { 0xF0000 } }
+    #[inline(always)]
     fn abs16(&self, a: u16) -> u32 { self.base() | a as u32 }
+    #[inline(always)]
     fn saddr(b: u8) -> u32 { if b < 0x20 { 0xFFF00 | b as u32 } else { 0xFFE00 | b as u32 } }
+    #[inline(always)]
     fn sfr(b: u8) -> u32 { 0xFFF00 | b as u32 }
+    #[inline(always)]
     fn sp_off(&self, d: u8) -> u32 { 0xF0000 | (self.sp().wrapping_add(d as u16) as u32) }
+    #[inline(always)]
     fn ind(&self, rp: usize, d: u16) -> u32 { (self.base() & 0xF0000) | (self.rp(rp).wrapping_add(d) as u32) }
+    #[inline(always)]
     fn based(&self, idx: u16, w: u16) -> u32 { (self.base() & 0xF0000) | (w.wrapping_add(idx) as u32) }
 
     // ---------- arithmetic ----------
+    #[inline(always)]
     fn alu8(&mut self, op: u8, x: u8, y: u8) -> u8 {
         // op: 0 ADD, 1 ADDC, 2 SUB, 3 SUBC, 4 CMP, 5 AND, 6 OR, 7 XOR
         let c = self.cy() as u16;
@@ -149,6 +177,7 @@ impl Rl78 {
         if op <= 4 { self.set_flag(PSW_CY, cy); self.set_flag(PSW_AC, ac); }
         res
     }
+    #[inline(always)]
     fn alu16(&mut self, op: u8, x: u16, y: u16) -> u16 {
         // op: 0 ADDW, 2 SUBW, 4 CMPW
         let (res, cy, ac) = if op == 0 { let s = x as u32 + y as u32; (s as u16, s > 0xFFFF, (x & 0xFF) + (y & 0xFF) > 0xFF) }
@@ -156,6 +185,7 @@ impl Rl78 {
         self.set_flag(PSW_Z, res == 0); self.set_flag(PSW_CY, cy); self.set_flag(PSW_AC, ac);
         res
     }
+    #[inline(always)]
     fn incdec8(&mut self, v: u8, inc: bool) -> u8 {
         let r = if inc { v.wrapping_add(1) } else { v.wrapping_sub(1) };
         self.set_flag(PSW_Z, r == 0);
@@ -164,7 +194,9 @@ impl Rl78 {
     }
 
     // ---------- stack ----------
+    #[inline(always)]
     fn push8<B: Rl78Bus>(&mut self, bus: &mut B, v: u8) -> R<()> { let s = self.sp().wrapping_sub(1); self.set_sp_raw(s); self.write8(bus, 0xF0000 | s as u32, v) }
+    #[inline(always)]
     fn set_sp_raw(&mut self, v: u16) { self.regs_hi[0] = v as u8; self.regs_hi[1] = (v >> 8) as u8; }
     fn push_pc<B: Rl78Bus>(&mut self, bus: &mut B, ret: u32, psw: Option<u8>) -> R<()> {
         let sp = self.sp();
@@ -196,7 +228,9 @@ impl Rl78 {
         self.halted = false; self.stopped = false;
         Ok(())
     }
+    #[inline(always)]
     pub fn isp(&self) -> u8 { (self.psw() >> 1) & 3 }
+    #[inline(always)]
     pub fn ie(&self) -> bool { self.psw() & PSW_IE != 0 }
 
     // ---------- instruction length (for the SKxx skips) ----------
@@ -234,6 +268,7 @@ impl Rl78 {
     }
 
     fn skip<B: Rl78Bus>(&mut self, bus: &mut B, cond: bool) { if cond { let l = self.insn_len(bus, self.pc); self.pc = (self.pc + l) & 0xFFFFF; } }
+    #[inline(always)]
     fn rel8<B: Rl78Bus>(&mut self, bus: &mut B, cond: bool) -> R<()> {
         self.cycles = if cond { 4 } else { 2 };
         let d = self.fetch(bus)? as i8;
@@ -379,6 +414,7 @@ impl Rl78 {
     }
 
     /// Word operand for MOVW AX,x / x,AX (rows A/B cols 8-F).
+    #[inline(always)]
     fn word_ea<B: Rl78Bus>(&mut self, bus: &mut B, lo: u8) -> R<u32> {
         Ok(match lo {
             8 => { let d = self.fetch(bus)?; self.sp_off(d) }
@@ -392,6 +428,7 @@ impl Rl78 {
         })
     }
 
+    #[inline(always)]
     fn cmp0(&mut self, v: u8) { self.set_flag(PSW_Z, v == 0); self.set_flag(PSW_AC, false); self.set_flag(PSW_CY, false); }
 
     /// CE FB xx: MULHU/MULH/DIVHU/DIVWU/MACHU/MACH (RL78-S3).

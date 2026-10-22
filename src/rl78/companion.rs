@@ -130,6 +130,23 @@ impl Companion {
         }
     }
 
+    /// Instructions while the controller runs (not halted or stopped, no debugging) and clocks remain: the same steps
+    /// as `advance`'s loop, with its clock budget kept in a register. Returns to that loop when it ends, when the CPU
+    /// halts or stops, on a fault and on an internal reset.
+    #[inline(never)]
+    fn run_steps(&mut self) {
+        let mut frac = self.frac;
+        loop {
+            if let Err(e) = self.g13.step(&mut self.cpu) { eprintln!("[rl78] fault {e:?}"); self.fault = Some(e); }
+            if self.g13.reset_request { self.frac = frac; self.chip_reset(); return; }
+            let c = self.cpu.cycles.max(1) as u64;
+            frac -= (c * DEN) as i64;
+            self.g13.tick(c);
+            if frac < DEN as i64 || self.cpu.halted || self.cpu.stopped || self.fault.is_some() { break; }
+        }
+        self.frac = frac;
+    }
+
     /// Advance by `p0` SH-2A peripheral clocks and exchange link bytes with SCIF7.
     pub fn advance(&mut self, p0: u64, scif: Option<&mut Scif>) {
         self.now += p0;
@@ -153,6 +170,7 @@ impl Companion {
                     continue;
                 }
             }
+            if !debug && !self.cpu.halted && !self.cpu.stopped { self.run_steps(); continue; }
             if let Err(e) = self.g13.step(&mut self.cpu) { eprintln!("[rl78] fault {e:?}"); self.fault = Some(e); }
             if self.g13.reset_request { self.chip_reset(); continue; }
             let c = self.cpu.cycles.max(1) as u64;

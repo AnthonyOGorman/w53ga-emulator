@@ -261,7 +261,7 @@ impl Machine {
         let c = Checkpoint::power_on()?;
         let (pc_v, sp_v) = if power_on { (0, 4) } else { (8, 12) };
         let rd = |m: &Memory, a: usize| u32::from_be_bytes(m.flash[a..a + 4].try_into().unwrap());
-        let mem = std::mem::replace(&mut self.cpu.mem, Memory { flash_cmd_mode: false, flash: Vec::new(), sdram: Vec::new(), oram: Vec::new() });
+        let mem = std::mem::replace(&mut self.cpu.mem, Memory { flash_cmd_mode: false, code_gen: 0, flash: Vec::new(), sdram: Vec::new(), oram: Vec::new() });
         let mut cpu = Cpu::new(mem);
         cpu.pc = rd(&cpu.mem, pc_v);
         cpu.r[15] = rd(&cpu.mem, sp_v);
@@ -489,6 +489,7 @@ impl Machine {
     pub fn run(&mut self, n: u64) -> Result<(), Stop> {
         self.debug_hooks = self.stop_pc.is_some() || !self.arg_log.is_empty() || self.call_counts.is_some();
         let end = self.steps + n;
+        self.cpu.code_may_have_changed();
         while self.steps < end {
             if self.debug_hooks || self.board.wdt.reset.is_some() || self.detect.as_ref().is_some_and(|d| d.verify.is_some()) { self.step()?; } else { self.run_fast()?; }
         }

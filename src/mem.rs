@@ -37,6 +37,9 @@ pub struct Memory {
     /// The NOR chip is in a command mode (protection-bit reads): flash data reads go to the board's NOR model.
     #[serde(skip)]
     pub flash_cmd_mode: bool,
+    /// Counts changes to the flash array made by the NOR model (programming, erasing), so that decoded code is checked.
+    #[serde(skip)]
+    pub code_gen: u64,
     pub flash: Vec<u8>,
     pub sdram: Vec<u8>,
     pub oram: Vec<u8>,
@@ -45,7 +48,7 @@ pub struct Memory {
 impl Memory {
     pub fn new(flash: Vec<u8>) -> Self {
         assert_eq!(flash.len(), FLASH_SIZE, "flash dump must be 32 MiB");
-        Memory { flash_cmd_mode: false, flash, sdram: vec![0; SDRAM_SIZE], oram: vec![0; ORAM_SIZE] }
+        Memory { flash_cmd_mode: false, code_gen: 0, flash, sdram: vec![0; SDRAM_SIZE], oram: vec![0; ORAM_SIZE] }
     }
 
     /// Slice for `n` bytes of plain memory at `a`, or None for MMIO / region-crossing accesses.

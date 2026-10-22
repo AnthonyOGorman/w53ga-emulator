@@ -554,7 +554,10 @@ impl Board {
     #[cold]
     #[inline(never)]
     fn flush_deferred_now(&mut self, mem: &mut Memory) {
-        if !self.nor.pending.is_empty() { if let Err(e) = self.nor.apply(&mut mem.flash) { self.fault.get_or_insert(e); } }
+        if !self.nor.pending.is_empty() {
+            mem.code_gen += 1;
+            if let Err(e) = self.nor.apply(&mut mem.flash) { self.fault.get_or_insert(e); }
+        }
         if !self.jcu_writes.is_empty() {
             let writes = std::mem::take(&mut self.jcu_writes);
             if let Some(j) = &mut self.jcu {

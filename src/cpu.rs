@@ -91,6 +91,9 @@ pub struct Cpu {
     /// A data access went to the MMIO bus (a device) since `run` started its current instruction.
     #[serde(skip)]
     io_touched: bool,
+    /// Decoded code in flash (`run`).
+    #[serde(skip)]
+    blocks: BlockCache,
     /// Call/return/branch observer for runtime HLE detection (`crate::detect`); None when not detecting.
     #[serde(skip)]
     pub trace: Option<Box<crate::detect::Trace>>,
@@ -108,7 +111,7 @@ impl Cpu {
         Cpu {
             r: [0; 16], sr: 0xF0, gbr: 0, vbr: 0, mach: 0, macl: 0, pr: 0, pc: 0, tbr: 0,
             fpscr: 0x0004_0001, fpul: 0, fr: [0; 16], banks: [Bank::default(); 15], mem,
-            float_mode: FloatMode::Hardware, sleeping: false, cur_pc: 0, watch: None, watch_log: Vec::new(), bank_anomalies: 0, fault: None, io_touched: false, trace: None,
+            float_mode: FloatMode::Hardware, sleeping: false, cur_pc: 0, watch: None, watch_log: Vec::new(), bank_anomalies: 0, fault: None, io_touched: false, blocks: BlockCache::default(), trace: None,
         }
     }
 
@@ -236,16 +239,55 @@ impl Cpu {
     /// instruction (see `RunLimits`, `RunExit`). Returns the instructions completed (a faulting one is not counted).
     /// Each instruction is exactly what `step` would execute; only the machine's checks between instructions are
     /// reduced to the ones that can change without a device access.
+    ///
+    /// Code in flash runs from decoded blocks (`BlockCache`): within a block nothing the checks look at can change, so
+    /// they are made once at its first instruction.
     pub fn run<M: Mmio>(&mut self, io: &mut M, l: &mut RunLimits) -> (u32, Result<RunExit, Fault>) {
         let io: &mut dyn Mmio = io;
+        let mut cache = std::mem::take(&mut self.blocks);
+        if cache.gen != self.mem.code_gen { cache.gen = self.mem.code_gen; cache.epoch = cache.epoch.wrapping_add(1); }
+        let r = self.run_with(io, l, &mut cache);
+        self.blocks = cache;
+        r
+    }
+
+    #[inline(always)]
+    fn run_with(&mut self, io: &mut dyn Mmio, l: &mut RunLimits, cache: &mut BlockCache) -> (u32, Result<RunExit, Fault>) {
         let (lo, hi) = l.hooks_range;
+        let hooks = l.hooks;
+        let trace_on = self.trace.is_some();
         let mut done = 0;
         self.io_touched = false;
         loop {
             let pc = self.pc;
             let imask = (self.sr >> 4) & 15;
-            if l.irq_level > imask || (pc == l.idle_pc && imask == 0) || (pc >= lo && pc <= hi && l.hooks.iter().any(|h| h.0 == pc)) {
+            if l.irq_level > imask || (pc == l.idle_pc && imask == 0) || (pc >= lo && pc <= hi && hooks.iter().any(|h| h.0 == pc)) {
                 return (done, Ok(RunExit::Check));
+            }
+            if let Some(b) = cache.block(&self.mem.flash, pc) {
+                // The checks above hold for every instruction of the block: SR.IMASK changes only at its end, the
+                // interrupt level only with a device access, and no idle-loop or hooked PC lies inside it.
+                let b = &cache.blocks[b];
+                let inside = |a: u32| a > pc && a < b.end;
+                if !inside(l.idle_pc) && !(lo <= hi && hooks.iter().any(|h| inside(h.0))) {
+                    let n = b.n.min(l.budget - done) as usize;
+                    for e in &cache.ops[b.first as usize..b.first as usize + n] {
+                        let k = *l.hist_pos & 63;
+                        l.history[k] = e.pc;
+                        l.hist_irq[k] = false;
+                        *l.hist_pos += 1;
+                        self.cur_pc = e.pc;
+                        self.pc = e.pc.wrapping_add(2);
+                        if !(e.f)(self, io, e.op) { return (done, Err(self.fault.take().unwrap_or(Fault::Illegal { pc: e.pc, op: e.op }))); }
+                        done += 1;
+                        if self.io_touched || (trace_on && self.trace.as_ref().is_some_and(|t| t.event)) {
+                            self.io_touched = false;
+                            return (done, Ok(RunExit::After(e.pc)));
+                        }
+                    }
+                    if done >= l.budget { return (done, Ok(RunExit::Budget)); }
+                    continue;
+                }
             }
             let k = *l.hist_pos & 63;
             l.history[k] = pc;
@@ -262,6 +304,10 @@ impl Cpu {
             if done >= l.budget { return (done, Ok(RunExit::Budget)); }
         }
     }
+
+    /// Code in flash may have been changed from outside the CPU (a new image, a test): blocks are compared with flash
+    /// again before they next run. `Machine::run` calls this on every call.
+    pub fn code_may_have_changed(&mut self) { self.blocks.epoch = self.blocks.epoch.wrapping_add(1); }
 
     /// Execute the slot instruction of a delayed branch at `slot_pc`.
     fn slot(&mut self, io: &mut dyn Mmio, slot_pc: u32) -> Result<(), Fault> {
@@ -523,6 +569,112 @@ pub enum RunExit {
     /// The instruction at this PC accessed a device or raised a detection event: the machine handles that next.
     After(u32),
 }
+
+/// Decoded straight-line code in flash, for `Cpu::run`. A block runs from its first instruction to the first one that
+/// can change the PC (a branch, call, return, TRAPA) or SR.IMASK (LDC to SR), inclusive, and at most `MAX_BLOCK`
+/// instructions. Blocks are found by their first PC (a table per 64 KiB of flash). Whenever flash may have changed,
+/// each block is compared with it again before it next runs (`epoch`): after NOR programming (`Memory::code_gen`) and
+/// on every `Machine::run` (in case the image was replaced or edited from outside).
+#[derive(Default)]
+pub struct BlockCache {
+    /// Per 64 KiB of flash: for each halfword, the index + 1 of the block starting there (0: none).
+    pages: Vec<Option<Box<[u32]>>>,
+    blocks: Vec<Block>,
+    ops: Vec<Decoded>,
+    /// The code bytes each block was decoded from.
+    code: Vec<u8>,
+    /// Blocks checked in an older epoch are compared with flash before they run.
+    epoch: u32,
+    /// `Memory::code_gen` when last seen.
+    gen: u64,
+}
+
+struct Block {
+    /// Address after the block's last instruction.
+    end: u32,
+    /// First instruction in `ops`, and the number of instructions.
+    first: u32,
+    n: u32,
+    /// The block's bytes in `code` (end - start of them).
+    code: u32,
+    epoch: u32,
+}
+
+#[derive(Clone, Copy)]
+struct Decoded { f: OpFn, op: u32, pc: u32 }
+
+/// Instructions per block at most.
+const MAX_BLOCK: usize = 64;
+/// Decoded instructions kept before the cache starts again from empty.
+const MAX_DECODED: usize = 1 << 20;
+
+impl BlockCache {
+    /// The block starting at `pc`, decoded first if needed; None when `pc` is not an instruction address in flash.
+    #[inline(always)]
+    fn block(&mut self, flash: &[u8], pc: u32) -> Option<usize> {
+        if pc & 1 != 0 || pc as usize + 2 > flash.len() { return None; }
+        if let Some(Some(p)) = self.pages.get((pc >> 16) as usize) {
+            let i = p[((pc & 0xFFFF) >> 1) as usize];
+            if i != 0 {
+                let i = i as usize - 1;
+                if self.blocks[i].epoch == self.epoch { return Some(i); }
+                return self.revalidate(flash, pc, i);
+            }
+        }
+        self.build(flash, pc)
+    }
+
+    /// A block from an older epoch: still the same code, or decoded again.
+    #[cold]
+    #[inline(never)]
+    fn revalidate(&mut self, flash: &[u8], pc: u32, i: usize) -> Option<usize> {
+        let b = &mut self.blocks[i];
+        let (s, len) = (pc as usize, (b.end - pc) as usize);
+        if flash.get(s..s + len) == self.code.get(b.code as usize..b.code as usize + len) {
+            b.epoch = self.epoch;
+            return Some(i);
+        }
+        self.build(flash, pc)
+    }
+
+    /// Decode the block starting at `pc` (None if not even its first instruction lies in flash).
+    #[cold]
+    #[inline(never)]
+    fn build(&mut self, flash: &[u8], pc: u32) -> Option<usize> {
+        if self.ops.len() > MAX_DECODED { *self = BlockCache { epoch: self.epoch, gen: self.gen, ..Default::default() }; }
+        let first = self.ops.len();
+        let mut a = pc as usize;
+        while self.ops.len() - first < MAX_BLOCK && a + 2 <= flash.len() {
+            let op = u16::from_be_bytes([flash[a], flash[a + 1]]) as u32;
+            let k = OPS[op as usize];
+            let len = if k == K::op_movi20 as u8 || k == K::op_disp12 as u8 || k == K::op_bitops as u8 { 4 } else { 2 };
+            if a + len > flash.len() { break; }
+            self.ops.push(Decoded { f: HANDLERS[k as usize], op, pc: a as u32 });
+            a += len;
+            if ENDS_BLOCK[k as usize] { break; }
+        }
+        let n = self.ops.len() - first;
+        if n == 0 { return None; }
+        let code = self.code.len();
+        self.code.extend_from_slice(&flash[pc as usize..a]);
+        self.blocks.push(Block { end: a as u32, first: first as u32, n: n as u32, code: code as u32, epoch: self.epoch });
+        let page = (pc >> 16) as usize;
+        if self.pages.len() <= page { self.pages.resize_with(page + 1, || None); }
+        let p = self.pages[page].get_or_insert_with(|| vec![0u32; 1 << 15].into_boxed_slice());
+        p[((pc & 0xFFFF) >> 1) as usize] = self.blocks.len() as u32;
+        Some(self.blocks.len() - 1)
+    }
+}
+
+/// Instruction kinds that end a block: they can change the PC, or SR.IMASK (and so which interrupts are accepted).
+static ENDS_BLOCK: [bool; 256] = {
+    let mut t = [false; 256];
+    let ends = [K::op_illegal, K::op_bsrf, K::op_braf, K::op_rts, K::op_rte, K::op_rtsn, K::op_rtvn, K::op_jsr, K::op_jmp, K::op_jsrn,
+        K::op_jsrn_tbr, K::op_bt_bf, K::op_bts_bfs, K::op_bra, K::op_bsr, K::op_trapa, K::op_ldc_sr, K::op_ldcl_sr];
+    let mut i = 0;
+    while i < ends.len() { t[ends[i] as usize] = true; i += 1; }
+    t
+};
 
 // ---------- instruction handlers ----------
 //

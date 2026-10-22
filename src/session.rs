@@ -139,7 +139,7 @@ impl Options {
                 let (wp, alts) = crate::gnss::parse_route_alt(r)?;
                 let mut g = crate::gnss::Gnss::new(wp, self.gps_speed.unwrap_or(50.0));
                 g.start_after = c.now() + 3_333_333;
-                g.altitudes = alts;
+                g.set_altitudes(alts);
                 g.cut_spans = self.gps_cut.clone();
                 c.gnss = Some(g);
             }

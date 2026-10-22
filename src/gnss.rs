@@ -60,12 +60,12 @@ pub struct Gnss {
     pub travelled: f64,
     #[serde(skip)]
     last_t: Option<f64>,
-    /// Stop at the last waypoint instead of driving the route back and forth.
+    /// Stop at the last waypoint instead of driving the route back and forth (`set_hold_at_end`).
     #[serde(skip)]
-    pub hold_at_end: bool,
-    /// Altitude of each waypoint (m); empty: a flat route at the default altitude.
+    hold_at_end: bool,
+    /// Altitude of each waypoint (m); empty: a flat route at the default altitude (`set_altitudes`).
     #[serde(skip)]
-    pub altitudes: Vec<f64>,
+    altitudes: Vec<f64>,
     /// Sky blocked by hand (a tunnel): no fix while set.
     #[serde(skip)]
     pub cut: bool,
@@ -124,15 +124,7 @@ struct Corner { s: f64, l1: f64, l2: f64, a: (f64, f64), v: (f64, f64), b: (f64,
 /// The path the vehicle drives, in metres east/north of the first waypoint: the waypoints (hold at the end), the
 /// waypoints closed into a loop (a route ending where it starts), or the waypoints and back again (back and forth).
 #[derive(Clone, Debug)]
-struct Path { key: (usize, u64, bool), lat0: f64, lon0: f64, k_lon: f64, pts: Vec<(f64, f64)>, alt: Vec<f64>, cum: Vec<f64>, total: f64, closed: bool, corners: Vec<Corner> }
-
-fn key(wp: &[(f64, f64)], alts: &[f64], hold: bool) -> (usize, u64, bool) {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    for (a, b) in wp { a.to_bits().hash(&mut h); b.to_bits().hash(&mut h); }
-    for a in alts { a.to_bits().hash(&mut h); }
-    (wp.len(), h.finish(), hold)
-}
+struct Path { lat0: f64, lon0: f64, k_lon: f64, pts: Vec<(f64, f64)>, alt: Vec<f64>, cum: Vec<f64>, total: f64, closed: bool, corners: Vec<Corner> }
 
 fn hdg(d: (f64, f64)) -> f64 { (d.0.atan2(d.1).to_degrees() + 360.0) % 360.0 }
 fn wrap180(a: f64) -> f64 { let x = (a + 180.0).rem_euclid(360.0) - 180.0; if x == -180.0 { 180.0 } else { x } }
@@ -183,7 +175,7 @@ impl Path {
                 corners.push(Corner { s: cum[j], l1, l2, a: (vtx.0 - din.0 * l, vtx.1 - din.1 * l), v: vtx, b: (vtx.0 + dout.0 * l, vtx.1 + dout.1 * l), din, dout, turn, bezier });
             }
         }
-        Path { key: (0, 0, hold), lat0, lon0, k_lon, pts, alt, cum, total, closed, corners }
+        Path { lat0, lon0, k_lon, pts, alt, cum, total, closed, corners }
     }
 
     /// Position (m), course (deg), altitude (m) and grade (rise per metre) after `s` metres of the path (wrapped).
@@ -239,17 +231,22 @@ impl Gnss {
         if let Some(v) = speed_kmh { self.speed_kmh = v; }
     }
 
-    /// The driven path for the current waypoints (rebuilt when they change).
+    /// Stop at the end of the route instead of driving it round or back and forth.
+    pub fn set_hold_at_end(&mut self, hold: bool) { self.hold_at_end = hold; self.path = None; }
+
+    /// Altitude of each waypoint (m); empty: a flat route at the default altitude.
+    pub fn set_altitudes(&mut self, altitudes: Vec<f64>) { self.altitudes = altitudes; self.path = None; }
+
+    /// The driven path for the current waypoints, built once after each change of the route (`reroute`,
+    /// `set_hold_at_end`, `set_altitudes`): looking a position up is then a binary search, however long the route.
     fn path(&mut self) -> Option<&Path> {
         if self.waypoints.len() < 2 { return None; }
-        let k = key(&self.waypoints, &self.altitudes, self.hold_at_end);
-        if self.path.as_ref().map(|p| p.key) != Some(k) {
-            let mut p = Path::build(&self.waypoints, &self.altitudes, self.hold_at_end, self.speed_kmh);
-            p.key = k;
-            self.path = Some(p);
-        }
+        if self.path.is_none() { self.path = Some(Path::build(&self.waypoints, &self.altitudes, self.hold_at_end, self.speed_kmh)); }
         self.path.as_ref()
     }
+
+    /// `current`, building the path first if the route has changed since (for callers that ask often).
+    pub fn current_mut(&mut self) -> Fix { self.path(); self.current() }
 
     /// Current fix (distance travelled so far, the vehicle's speed).
     pub fn current(&self) -> Fix {
@@ -268,8 +265,8 @@ impl Gnss {
         if wp.len() < 2 { let (lat, lon) = wp.first().copied().unwrap_or((35.0, 135.0)); return Fix { lat, lon, speed_kmh: 0.0, heading: 0.0, alt: self.altitudes.first().copied().unwrap_or(DEFAULT_ALT) }; }
         let built;
         let path = match &self.path {
-            Some(p) if p.key == key(wp, &self.altitudes, self.hold_at_end) => p,
-            _ => { built = Path::build(wp, &self.altitudes, self.hold_at_end, self.speed_kmh); &built }
+            Some(p) => p,
+            None => { built = Path::build(wp, &self.altitudes, self.hold_at_end, self.speed_kmh); &built }
         };
         let (pos, heading, alt, _) = path.at(dist);
         let (lat, lon) = path.latlon(pos);

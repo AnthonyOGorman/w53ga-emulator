@@ -247,7 +247,7 @@ pub unsafe extern "C" fn emu_gps_route(p: *const u8, n: usize, speed: f64, hold:
             Some(g) => g.reroute(wp, Some(speed)),
             None => { let mut g = w53ga_emu::gnss::Gnss::new(wp, speed); g.start_after = c.now() + (P0_HZ / 10.0) as u64; c.gnss = Some(g); }
         }
-        if let Some(g) = c.gnss.as_mut() { g.hold_at_end = hold != 0; g.altitudes = alts; }
+        if let Some(g) = c.gnss.as_mut() { g.set_hold_at_end(hold != 0); g.set_altitudes(alts); }
         0
     }).unwrap_or_else(|| err("no state loaded"))
 }

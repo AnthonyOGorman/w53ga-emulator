@@ -168,7 +168,7 @@ onmessage = async (e) => {
         if (m.cid && str(m.cid, ex.emu_sd_cid) !== 0) throw new Error(text());
         ex.emu_accessories(m.obd2 ? 1 : 0, m.dvr ? 1 : 0);
         str(m.wifi || '', ex.emu_wifi); wifi = !!m.wifi;
-        if (m.route) str(m.route, ex.emu_gps_route, m.speed, 1);
+        if (m.route) str(m.route, ex.emu_gps_route, m.speed, m.hold === false ? 0 : 1);
         if (m.radar) ex.emu_radar(m.radar);
         ex.emu_status();
         const profile = JSON.parse(text()).profile;

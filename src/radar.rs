@@ -48,6 +48,9 @@ impl Scene {
         Ok(Scene { sources, manual: 0.0 })
     }
 
+    /// Does the strength depend on where the unit is (a radar placed at a location)?
+    pub fn needs_position(&self) -> bool { self.sources.iter().any(|s| matches!(s, Source::Fixed { .. })) }
+
     /// Strength the receiver hears at emulated time `t_s` and the unit's position (if it has one).
     pub fn strength(&self, t_s: f64, pos: Option<(f64, f64)>) -> f64 {
         let mut s = self.manual;

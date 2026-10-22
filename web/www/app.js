@@ -14,6 +14,7 @@ let powerOnAvailable = false, wasmReady = false;
 let running = false, paused = false, started = false, startedMode = '';
 let lastStatus = null, sdDirty = false;
 let heading = 0, car = null;
+let pendingRoute = null;  // { pts, hold }: a route chosen before the unit is switched on, driven from the start
 let gpsCut = false;
 
 // ---------------------------------------------------------------- worker
@@ -38,7 +39,9 @@ worker.onmessage = (e) => {
       started = true; running = true; paused = false; startedMode = m.mode;
       showCut(false);
       $('overlay').classList.add('hidden');
-      msg([m.mode === 'power-on' ? 'Switched on: the unit boots from reset (about 45 s to the map).' : 'State resumed.', m.note, m.profile ? `HLE profile: ${m.profile}.` : 'HLE off: 2D graphics calls are not drawn.', m.skipped ? `Skipped (not 8.3 names): ${m.skipped}` : '', m.mode === 'power-on' && m.card && !m.cid ? 'No card CID given: the unit will report an SD card error and the map will have no data (see README, "Card CID").' : ''].filter(Boolean).join(' '), 'ok');
+      const routeNote = pendingRoute ? `Driving the loaded route (${pendingRoute.pts.length} points).` : '';
+      pendingRoute = null;
+      msg([m.mode === 'power-on' ? 'Switched on: the unit boots from reset (about 45 s to the map).' : 'State resumed.', routeNote, m.note, m.profile ? `HLE profile: ${m.profile}.` : 'HLE off: 2D graphics calls are not drawn.', m.skipped ? `Skipped (not 8.3 names): ${m.skipped}` : '', m.mode === 'power-on' && m.card && !m.cid ? 'No card CID given: the unit will report an SD card error and the map will have no data (see README, "Card CID").' : ''].filter(Boolean).join(' '), 'ok');
       refresh();
       break;
     case 'stopped': running = false; msg('Stopped: ' + m.reason, 'err'); refresh(); break;
@@ -187,7 +190,8 @@ async function start(mode) {
       cmd: 'init', mode, files: sd ? sd.files : [], dir: sd && sd.mode === 'rw' ? sd.handle : null,
       cid: $('in-cid').value.trim(),
       obd2: $('acc-obd2').checked, dvr: $('acc-dvr').checked, wifi: $('acc-wifi').checked ? $('in-ssid').value : '',
-      route: car ? `${car[0]},${car[1]}` : '35.6812,139.7671', speed: +$('gps-speed').value,
+      route: pendingRoute ? pendingRoute.pts.join(';') : car ? `${car[0]},${car[1]}` : '35.6812,139.7671',
+      hold: pendingRoute ? pendingRoute.hold : true, speed: +$('gps-speed').value,
       radar: +$('radar-strength').value / 100,
     };
     init.flash = await files.flash.arrayBuffer();
@@ -236,7 +240,9 @@ function onStatus(s) {
   if (s.gps) {
     const sky = s.gps.cut ? ' · <span class="cut">no fix (tunnel)</span>' : s.gps.fix === false ? ' · <span class="cut">acquiring</span>' : '';
     gps.innerHTML = `GPS <b>${s.gps.lat.toFixed(4)}, ${s.gps.lon.toFixed(4)}</b> · ${(s.gps.actual ?? s.gps.speed).toFixed(0)} km/h${sky}`;
-    car = [s.gps.lat, s.gps.lon]; if (carMarker) carMarker.setLatLng(car);
+    const prev = car;
+    car = [s.gps.lat, s.gps.lon];
+    if (carMarker) { carMarker.setLatLng(car); follow(prev); }
     $('gps-cut-note').textContent = s.gps.cut ? 'In the tunnel: no GPS fix, the car drives on' : s.gps.fix === false ? 'Out of the tunnel: re-acquiring…' : 'GPS sky clear';
   }
   const acc = [];
@@ -291,6 +297,7 @@ function sendWifi() { if (started) worker.postMessage({ cmd: 'wifi', spec: $('ac
 document.querySelectorAll('.seg button').forEach((b) => b.addEventListener('click', () => {
   document.querySelectorAll('.seg button').forEach((x) => x.classList.toggle('on', x === b));
   document.querySelectorAll('.tab').forEach((p) => { p.hidden = p.dataset.pane !== b.dataset.tab; });
+  if (b.dataset.tab === 'map' && map) map.invalidateSize();   // its size may have changed while hidden
 }));
 function speed() { return +$('gps-speed').value; }
 // tunnel: the GPS sky is blocked (no fix) while the drive goes on
@@ -308,7 +315,8 @@ $('gps-cut').addEventListener('click', toggleCut);
 function sendRoute(text, hold) {
   const pts = text.split(/\r?\n/).map((l) => l.split('#')[0]).flatMap((l) => l.split(';')).map((p) => p.trim()).filter((p) => /^-?[\d.]+\s*,\s*-?[\d.]+(\s*,\s*-?[\d.]+)?$/.test(p));
   if (!pts.length) return msg('The route has no points.', 'err');
-  if (!started) { msg('Start the unit first, then choose the route.', 'err'); return; }
+  showRoute(pts);
+  if (!started) { pendingRoute = { pts, hold }; msg(`Route of ${pts.length} points loaded: the unit drives it once you switch it on.`, 'ok'); return; }
   worker.postMessage({ cmd: 'route', route: pts.join(';'), speed: speed(), hold });
   msg(`Driving a route of ${pts.length} points at ${speed()} km/h.`, 'ok');
 }
@@ -317,7 +325,8 @@ $('route-sample').addEventListener('change', async () => {
   if (!v) return;
   try { sendRoute(await (await fetch(v)).text(), false); } catch (e) { msg('Route not loaded: ' + e.message, 'err'); }
 });
-$('in-route').addEventListener('change', async () => { const f = $('in-route').files[0]; if (f) sendRoute(await f.text(), false); });
+// cleared after each choice, so that choosing the same file again loads it again
+$('in-route').addEventListener('change', async () => { const f = $('in-route').files[0]; $('in-route').value = ''; if (f) sendRoute(await f.text(), false); });
 $('radar-strength').addEventListener('input', () => {
   const v = +$('radar-strength').value;
   $('radar-strength-v').textContent = v ? `${v} %` : 'off';
@@ -348,7 +357,20 @@ $('drv-go').addEventListener('click', () => {
   steer(0);
 });
 // optional OpenStreetMap view (Leaflet and tiles are fetched only after the user asks for it)
-let map = null, carMarker = null, target = null;
+let map = null, carMarker = null, target = null, routeLine = null, routePts = null;
+// the loaded route on the map, the whole of it in view
+function showRoute(pts) { routePts = pts.map((p) => p.split(',').slice(0, 2).map(Number)); if (map) drawRoute(); }
+function drawRoute() {
+  if (routeLine) routeLine.remove();
+  routeLine = L.polyline(routePts, { color: '#2563eb', weight: 3, opacity: 0.5 }).addTo(map);
+  map.fitBounds(routeLine.getBounds(), { padding: [20, 20] });
+}
+// keep the car in view when it drives (or jumps) out of it; not while the map has been moved away from the car
+function follow(prev) {
+  if (!map || !prev) return;
+  const b = map.getBounds();
+  if (b.contains(prev) && !b.contains(car)) map.panTo(car);
+}
 $('map-enable').addEventListener('click', async () => {
   $('map-enable').disabled = true;
   try {
@@ -361,6 +383,7 @@ $('map-enable').addEventListener('click', async () => {
     map = L.map('map').setView(at, 14);
     L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap contributors' }).addTo(map);
     carMarker = L.circleMarker(at, { radius: 7, color: '#2563eb', fillOpacity: .9 }).addTo(map);
+    if (routePts) drawRoute();
     map.on('click', (e) => {
       if (!started) return msg('Start the unit first.', 'err');
       const p = [e.latlng.lat, e.latlng.lng];

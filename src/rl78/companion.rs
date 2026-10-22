@@ -353,7 +353,8 @@ impl Companion {
             g.tick(self.now, &mut out);
             if !out.is_empty() { self.g13.uart_receive(GPS_UART, &out); }
         }
-        let pos = self.gnss.as_ref().map(|g| { let f = g.current(); (f.lat, f.lon) });
+        // the position only for radars placed at a location: this runs after every batch
+        let pos = if self.radar.needs_position() { self.gnss.as_mut().map(|g| { let f = g.current_mut(); (f.lat, f.lon) }) } else { None };
         if let Some(t) = &mut self.taps { if t.active { t.after_batch(self.now, &self.cpu); } }
         self.g13.rx.radar = self.radar.strength(self.now as f64 / (100.0e6 / 3.0), pos);
         if let Some(s) = scif {

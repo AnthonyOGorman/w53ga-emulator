@@ -40,6 +40,9 @@ pub struct Memory {
     /// Counts changes to the flash array made by the NOR model (programming, erasing), so that decoded code is checked.
     #[serde(skip)]
     pub code_gen: u64,
+    /// Counts writes from outside the CPU (`store_bytes`: DMA, JPEG unit, camera, software 2D drawing).
+    #[serde(skip)]
+    pub ext_writes: u64,
     pub flash: Vec<u8>,
     pub sdram: Vec<u8>,
     pub oram: Vec<u8>,
@@ -48,7 +51,7 @@ pub struct Memory {
 impl Memory {
     pub fn new(flash: Vec<u8>) -> Self {
         assert_eq!(flash.len(), FLASH_SIZE, "flash dump must be 32 MiB");
-        Memory { flash_cmd_mode: false, code_gen: 0, flash, sdram: vec![0; SDRAM_SIZE], oram: vec![0; ORAM_SIZE] }
+        Memory { flash_cmd_mode: false, code_gen: 0, ext_writes: 0, flash, sdram: vec![0; SDRAM_SIZE], oram: vec![0; ORAM_SIZE] }
     }
 
     /// Slice for `n` bytes of plain memory at `a`, or None for MMIO / region-crossing accesses.
@@ -136,11 +139,12 @@ impl Memory {
         }
     }
 
-    /// Raw byte store used by checkpoint loading and external (DMA/peripheral) writes.
+    /// Raw byte store used by checkpoint loading and external (DMA/peripheral) writes (counted in `ext_writes`).
     pub fn store_bytes(&mut self, a: u32, bytes: &[u8]) -> bool {
         match self.plain_mut(a, bytes.len()) {
             Some(s) => {
                 s.copy_from_slice(bytes);
+                self.ext_writes += 1;
                 true
             }
             None => false,

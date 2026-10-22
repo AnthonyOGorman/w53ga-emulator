@@ -94,6 +94,15 @@ pub struct Cpu {
     /// Call/return/branch observer for runtime HLE detection (`crate::detect`); None when not detecting.
     #[serde(skip)]
     pub trace: Option<Box<crate::detect::Trace>>,
+    /// `watch` is set or `wcheck` is on: data accesses call `watched` (refreshed by `step` and `run`).
+    #[serde(skip)]
+    access_hooks: bool,
+    /// Store check for the busy-loop fast-forward (`Machine::spin_try`): while on, a store to memory that changes
+    /// its contents (or goes anywhere but plain memory) sets `wnoisy`.
+    #[serde(skip)]
+    wcheck: bool,
+    #[serde(skip)]
+    pub(crate) wnoisy: bool,
 }
 
 #[inline]
@@ -109,8 +118,29 @@ impl Cpu {
             r: [0; 16], sr: 0xF0, gbr: 0, vbr: 0, mach: 0, macl: 0, pr: 0, pc: 0, tbr: 0,
             fpscr: 0x0004_0001, fpul: 0, fr: [0; 16], banks: [Bank::default(); 15], mem,
             float_mode: FloatMode::Hardware, sleeping: false, cur_pc: 0, watch: None, watch_log: Vec::new(), bank_anomalies: 0, fault: None, io_touched: false, trace: None,
+            access_hooks: false, wcheck: false, wnoisy: false,
         }
     }
+
+    /// Can the instruction at `pc` (with its delay slot if it is a delayed branch) be part of a fast-forwarded busy-wait
+    /// loop (`Machine::spin_find`): not one that depends on or changes state outside the registers the loop is checked
+    /// with and memory (register banks, IBNR, SR.IMASK, sleep) or enters or leaves exception handling.
+    pub(crate) fn spin_safe(&self, pc: u32) -> bool {
+        let Some(op) = self.mem.fetch16(pc) else { return false };
+        let k = OPS[op as usize] as usize;
+        if SPIN_UNSAFE[k] { return false; }
+        if DELAYED[k] { return self.mem.fetch16(pc.wrapping_add(2)).is_some_and(|s| !SPIN_UNSAFE[OPS[s as usize] as usize]); }
+        true
+    }
+
+    /// Turn the store check on (clearing `wnoisy`) or off (see `wcheck`).
+    pub(crate) fn set_store_check(&mut self, on: bool) {
+        self.wcheck = on;
+        self.wnoisy = false;
+        self.refresh_hooks();
+    }
+    #[inline(always)]
+    fn refresh_hooks(&mut self) { self.access_hooks = self.watch.is_some() || self.wcheck; }
 
     #[inline] pub fn t(&self) -> bool { self.sr & SR_T != 0 }
     #[inline] pub fn set_t(&mut self, t: bool) { if t { self.sr |= SR_T } else { self.sr &= !SR_T } }
@@ -146,13 +176,13 @@ impl Cpu {
     pub fn read(&mut self, io: &mut dyn Mmio, a: u32, n: usize) -> Result<u32, Fault> {
         if a as usize & (n - 1) != 0 { return Err(self.misaligned(a, n, false)); }
         let v = match self.mem.read_fast(a, n) { Some(v) => v, None => self.read_slow(io, a, n) };
-        if self.watch.is_some() { self.watched(a, n, false, v); }
+        if self.access_hooks { self.watched(a, n, false, v); }
         Ok(v)
     }
     #[inline(always)]
     pub fn write(&mut self, io: &mut dyn Mmio, a: u32, n: usize, v: u32) -> Result<(), Fault> {
         if a as usize & (n - 1) != 0 { return Err(self.misaligned(a, n, true)); }
-        if self.watch.is_some() { self.watched(a, n, true, v); }
+        if self.access_hooks { self.watched(a, n, true, v); }
         if !self.mem.write_fast(a, n, v) { self.write_slow(io, a, n, v); }
         Ok(())
     }
@@ -175,11 +205,13 @@ impl Cpu {
     #[cold]
     #[inline(never)]
     fn misaligned(&self, a: u32, n: usize, write: bool) -> Fault { Fault::Address { pc: self.cur_pc, addr: a, size: n, write } }
-    /// Debug watchpoint (`watch`): log the access if it overlaps.
+    /// Debug watchpoint (`watch`): log the access if it overlaps. Store check (`wcheck`): note a store that changes
+    /// memory (called before the store).
     #[cold]
     #[inline(never)]
     fn watched(&mut self, a: u32, n: usize, write: bool, v: u32) {
         if let Some((s, e)) = self.watch { if a < e && a + n as u32 > s && self.watch_log.len() < 100_000 { self.watch_log.push((self.cur_pc, a, n, write, v)); } }
+        if write && self.wcheck && self.mem.read_plain(a, n) != Some(v as u64) { self.wnoisy = true; }
     }
     #[inline(always)] fn r8(&mut self, io: &mut dyn Mmio, a: u32) -> Result<u32, Fault> { self.read(io, a, 1) }
     #[inline(always)] fn r16(&mut self, io: &mut dyn Mmio, a: u32) -> Result<u32, Fault> { self.read(io, a, 2) }
@@ -244,6 +276,7 @@ impl Cpu {
     /// One instruction (a delayed branch together with its slot).
     #[inline]
     pub fn step_dyn(&mut self, io: &mut dyn Mmio) -> Result<(), Fault> {
+        self.refresh_hooks();
         let pc = self.pc;
         self.cur_pc = pc;
         let op = self.fetch(pc)?;
@@ -259,6 +292,7 @@ impl Cpu {
     /// nothing the checks look at can change, so they are made once at its first instruction.
     pub fn run<M: Mmio>(&mut self, io: &mut M, l: &mut RunLimits, cache: &mut BlockCache) -> (u32, Result<RunExit, Fault>) {
         if cache.gen != self.mem.code_gen { cache.gen = self.mem.code_gen; cache.invalidate(); }
+        self.refresh_hooks();
         self.run_with(io, l, cache)
     }
 
@@ -684,6 +718,24 @@ impl BlockCache {
         Some(self.blocks.len() - 1)
     }
 }
+
+/// Instruction kinds a busy-wait loop may not contain (`Cpu::spin_safe`).
+static SPIN_UNSAFE: [bool; 256] = {
+    let mut t = [false; 256];
+    let kinds = [K::op_illegal, K::op_sleep, K::op_rte, K::op_trapa, K::op_resbank, K::op_bank, K::op_ldc_sr, K::op_ldcl_sr];
+    let mut i = 0;
+    while i < kinds.len() { t[kinds[i] as usize] = true; i += 1; }
+    t
+};
+
+/// Delayed branches (their slot instruction executes in the same step).
+static DELAYED: [bool; 256] = {
+    let mut t = [false; 256];
+    let kinds = [K::op_bsrf, K::op_braf, K::op_rts, K::op_rte, K::op_jsr, K::op_jmp, K::op_bts_bfs, K::op_bra, K::op_bsr];
+    let mut i = 0;
+    while i < kinds.len() { t[kinds[i] as usize] = true; i += 1; }
+    t
+};
 
 /// Instruction kinds that end a block: they can change the PC, or SR.IMASK (and so which interrupts are accepted).
 static ENDS_BLOCK: [bool; 256] = {

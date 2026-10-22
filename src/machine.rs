@@ -455,12 +455,17 @@ impl Machine {
     /// Save the state into any writer (gzip-compressed bincode with the version header).
     pub fn save_state_to(&self, w: impl std::io::Write) -> Result<(), String> {
         let mut z = flate2::write::GzEncoder::new(w, flate2::Compression::fast());
-        std::io::Write::write_all(&mut z, STATE_MAGIC).map_err(|e| e.to_string())?;
-        bincode::serialize_into(&mut z, self).map_err(|e| e.to_string())?;
-        // Runtime HLE detection results follow the machine as an optional trailer (older readers ignore it).
-        if let Some(d) = &self.detect {
-            std::io::Write::write_all(&mut z, DETECT_MAGIC).map_err(|e| e.to_string())?;
-            bincode::serialize_into(&mut z, &d.found).map_err(|e| e.to_string())?;
+        {
+            // bincode writes byte arrays (the memories) one byte per call: buffer them before the compressor
+            let mut b = std::io::BufWriter::with_capacity(1 << 16, &mut z);
+            std::io::Write::write_all(&mut b, STATE_MAGIC).map_err(|e| e.to_string())?;
+            bincode::serialize_into(&mut b, self).map_err(|e| e.to_string())?;
+            // Runtime HLE detection results follow the machine as an optional trailer (older readers ignore it).
+            if let Some(d) = &self.detect {
+                std::io::Write::write_all(&mut b, DETECT_MAGIC).map_err(|e| e.to_string())?;
+                bincode::serialize_into(&mut b, &d.found).map_err(|e| e.to_string())?;
+            }
+            std::io::Write::flush(&mut b).map_err(|e| e.to_string())?;
         }
         z.finish().map_err(|e| e.to_string())?;
         Ok(())
@@ -474,7 +479,8 @@ impl Machine {
 
     /// Load a state from any reader (as written by `save_state_to`).
     pub fn load_state_from(r: impl std::io::Read) -> Result<Machine, String> {
-        let mut z = flate2::read::GzDecoder::new(r);
+        // bincode reads byte arrays one byte per call: buffer the decompressed stream
+        let mut z = std::io::BufReader::with_capacity(1 << 16, flate2::read::GzDecoder::new(r));
         let mut magic = [0u8; 16];
         std::io::Read::read_exact(&mut z, &mut magic).map_err(|e| e.to_string())?;
         if &magic != STATE_MAGIC { return Err(format!("not a state of this emulator version (header {:?})", String::from_utf8_lossy(&magic))); }

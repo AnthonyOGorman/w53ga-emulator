@@ -35,6 +35,8 @@ w53ga-*.png
 w53ga-*.state
 *.local.*
 .env
+# Personal files (custom GPS routes, notes with real places or paths): kept in local/, never committed.
+/local/
 
 # Editors and OS
 .vscode/

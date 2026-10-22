@@ -84,13 +84,14 @@ impl Memory {
         })
     }
 
-    /// Data read fast path for an aligned 1-, 2- or 4-byte access: SDRAM (either mirror), and flash while it is in
-    /// array mode. None: not one of those (use `read_plain`).
+    /// Data read fast path for an aligned 1-, 2- or 4-byte access: SDRAM (either mirror), flash while it is in array
+    /// mode, on-chip RAM. None: not one of those (use `read_plain`).
     #[inline(always)]
     pub fn read_fast(&self, a: u32, n: usize) -> Option<u32> {
-        let a = a & 0xDFFF_FFFF;
-        let (m, o) = if a.wrapping_sub(SDRAM_BASE) < SDRAM_SIZE as u32 { (&self.sdram, (a - SDRAM_BASE) as usize) }
-            else if a < FLASH_SIZE as u32 && !self.flash_cmd_mode { (&self.flash, a as usize) }
+        let c = a & 0xDFFF_FFFF;
+        let (m, o) = if c.wrapping_sub(SDRAM_BASE) < SDRAM_SIZE as u32 { (&self.sdram, (c - SDRAM_BASE) as usize) }
+            else if c < FLASH_SIZE as u32 { if self.flash_cmd_mode { return None; } (&self.flash, c as usize) }
+            else if a.wrapping_sub(ORAM_BASE) < ORAM_SIZE as u32 { (&self.oram, (a - ORAM_BASE) as usize) }
             else { return None };
         Some(match n {
             1 => *m.get(o)? as u32,
@@ -99,13 +100,15 @@ impl Memory {
         })
     }
 
-    /// Data write fast path for an aligned 1-, 2- or 4-byte access to SDRAM (either mirror). False: not SDRAM (use
-    /// `write_plain`).
+    /// Data write fast path for an aligned 1-, 2- or 4-byte access to SDRAM (either mirror) or on-chip RAM. False: not
+    /// one of those (use `write_plain`).
     #[inline(always)]
     pub fn write_fast(&mut self, a: u32, n: usize, v: u32) -> bool {
         let o = (a & 0xDFFF_FFFF).wrapping_sub(SDRAM_BASE) as usize;
-        if o >= SDRAM_SIZE { return false; }
-        let Some(s) = self.sdram.get_mut(o..o + n) else { return false };
+        let s = if o < SDRAM_SIZE { self.sdram.get_mut(o..o + n) }
+            else if a.wrapping_sub(ORAM_BASE) < ORAM_SIZE as u32 { let o = (a - ORAM_BASE) as usize; self.oram.get_mut(o..o + n) }
+            else { return false };
+        let Some(s) = s else { return false };
         match n { 1 => s[0] = v as u8, 2 => s.copy_from_slice(&(v as u16).to_be_bytes()), _ => s.copy_from_slice(&v.to_be_bytes()) }
         true
     }

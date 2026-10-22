@@ -37,6 +37,12 @@ pub struct Memory {
     /// The NOR chip is in a command mode (protection-bit reads): flash data reads go to the board's NOR model.
     #[serde(skip)]
     pub flash_cmd_mode: bool,
+    /// Counts changes to the flash array made by the NOR model (programming, erasing), so that decoded code is checked.
+    #[serde(skip)]
+    pub code_gen: u64,
+    /// Counts writes from outside the CPU (`store_bytes`: DMA, JPEG unit, camera, software 2D drawing).
+    #[serde(skip)]
+    pub ext_writes: u64,
     pub flash: Vec<u8>,
     pub sdram: Vec<u8>,
     pub oram: Vec<u8>,
@@ -45,7 +51,7 @@ pub struct Memory {
 impl Memory {
     pub fn new(flash: Vec<u8>) -> Self {
         assert_eq!(flash.len(), FLASH_SIZE, "flash dump must be 32 MiB");
-        Memory { flash_cmd_mode: false, flash, sdram: vec![0; SDRAM_SIZE], oram: vec![0; ORAM_SIZE] }
+        Memory { flash_cmd_mode: false, code_gen: 0, ext_writes: 0, flash, sdram: vec![0; SDRAM_SIZE], oram: vec![0; ORAM_SIZE] }
     }
 
     /// Slice for `n` bytes of plain memory at `a`, or None for MMIO / region-crossing accesses.
@@ -81,10 +87,39 @@ impl Memory {
         })
     }
 
+    /// Data read fast path for an aligned 1-, 2- or 4-byte access: SDRAM (either mirror), flash while it is in array
+    /// mode, on-chip RAM. None: not one of those (use `read_plain`).
+    #[inline(always)]
+    pub fn read_fast(&self, a: u32, n: usize) -> Option<u32> {
+        let c = a & 0xDFFF_FFFF;
+        let (m, o) = if c.wrapping_sub(SDRAM_BASE) < SDRAM_SIZE as u32 { (&self.sdram, (c - SDRAM_BASE) as usize) }
+            else if c < FLASH_SIZE as u32 { if self.flash_cmd_mode { return None; } (&self.flash, c as usize) }
+            else if a.wrapping_sub(ORAM_BASE) < ORAM_SIZE as u32 { (&self.oram, (a - ORAM_BASE) as usize) }
+            else { return None };
+        Some(match n {
+            1 => *m.get(o)? as u32,
+            2 => u16::from_be_bytes(m.get(o..o + 2)?.try_into().ok()?) as u32,
+            _ => u32::from_be_bytes(m.get(o..o + 4)?.try_into().ok()?),
+        })
+    }
+
+    /// Data write fast path for an aligned 1-, 2- or 4-byte access to SDRAM (either mirror) or on-chip RAM. False: not
+    /// one of those (use `write_plain`).
+    #[inline(always)]
+    pub fn write_fast(&mut self, a: u32, n: usize, v: u32) -> bool {
+        let o = (a & 0xDFFF_FFFF).wrapping_sub(SDRAM_BASE) as usize;
+        let s = if o < SDRAM_SIZE { self.sdram.get_mut(o..o + n) }
+            else if a.wrapping_sub(ORAM_BASE) < ORAM_SIZE as u32 { let o = (a - ORAM_BASE) as usize; self.oram.get_mut(o..o + n) }
+            else { return false };
+        let Some(s) = s else { return false };
+        match n { 1 => s[0] = v as u8, 2 => s.copy_from_slice(&(v as u16).to_be_bytes()), _ => s.copy_from_slice(&v.to_be_bytes()) }
+        true
+    }
+
     /// Instruction fetch fast path (flash and on-chip RAM), falling back to the general lookup.
     #[inline(always)]
     pub fn fetch16(&self, a: u32) -> Option<u16> {
-        if a < 0x0200_0000 { let i = a as usize; return Some(u16::from_be_bytes([self.flash[i], self.flash[i + 1]])); }
+        if a < 0x0200_0000 { if let Some(b) = self.flash.get(a as usize..a as usize + 2) { return Some(u16::from_be_bytes([b[0], b[1]])); } }
         self.read_plain(a, 2).map(|v| v as u16)
     }
 
@@ -104,11 +139,12 @@ impl Memory {
         }
     }
 
-    /// Raw byte store used by checkpoint loading and external (DMA/peripheral) writes.
+    /// Raw byte store used by checkpoint loading and external (DMA/peripheral) writes (counted in `ext_writes`).
     pub fn store_bytes(&mut self, a: u32, bytes: &[u8]) -> bool {
         match self.plain_mut(a, bytes.len()) {
             Some(s) => {
                 s.copy_from_slice(bytes);
+                self.ext_writes += 1;
                 true
             }
             None => false,

@@ -35,6 +35,9 @@ pub struct Src {
     b: Option<(i16, i16)>,
     units_in: u64, units_out: u64, flush_target: Option<u64>,
     pub converted: u64,
+    /// A tick while quiescent has run and nothing has touched the converter since (`tick_quiescent`).
+    #[serde(skip)]
+    settled: bool,
 }
 
 type R<T> = Result<T, String>;
@@ -61,6 +64,7 @@ impl Src {
     }
 
     pub fn read(&mut self, a: u32, n: usize) -> R<u64> {
+        self.settled = false;
         let o = a - SRC_BASE;
         Ok(match (o, n) {
             (0, 4) => 0, (0, 2) | (2, 2) => 0,
@@ -92,6 +96,7 @@ impl Src {
     }
 
     pub fn write(&mut self, a: u32, n: usize, v: u64) -> R<()> {
+        self.settled = false;
         let o = a - SRC_BASE;
         let v = v as u32;
         match (o, n) {
@@ -147,6 +152,7 @@ impl Src {
     pub fn quiescent(&self) -> bool { self.inp.is_empty() && self.b.is_none() && self.flush_target.is_none() }
 
     pub fn tick(&mut self) {
+        self.settled = false;
         if !self.enabled() { return; }
         let (fi, fo) = (ifs_hz(self.ifs()).unwrap_or(44100.0), ofs_hz(self.ofs()).unwrap_or(44100.0));
         let step = fi / fo;
@@ -172,6 +178,14 @@ impl Src {
         if self.inp.len() <= self.iftrg() { self.flags |= 2; }
         self.levels();
         self.check_end();
+    }
+
+    /// A tick while `quiescent`. Such a tick only sets the IINT/OINT flags from the FIFO levels, so once it has run, the
+    /// next one changes nothing until the converter is read or written: it is then not repeated.
+    pub fn tick_quiescent(&mut self) {
+        if self.settled { return; }
+        self.tick();
+        self.settled = true;
     }
 
     /// DMA request lines: IDEI (0x41: IEN && IINT), ODFI (0x42: OEN && OINT).

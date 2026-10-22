@@ -108,7 +108,7 @@ target/release/w53ga --flash FLASH.bin --rl78 CONTROLLER.bin --sd path/to/SDCard
 
 | Binary | Purpose |
 |---|---|
-| `w53ga` | Window with the unit's screen at real-time speed, keyboard as the remote, audio out. Keys as in the browser (<kbd>T</kbd> tunnel included), plus <kbd>+</kbd>/<kbd>-</kbd> GPS speed, <kbd>G</kbd> GPS stop/go, <kbd>R</kbd> radar off/weak/medium/strong, <kbd>F9</kbd> save state, <kbd>Esc</kbd> quit. |
+| `w53ga` | Window with the unit's screen at real-time speed, keyboard as the remote, audio out. Keys as in the browser (<kbd>T</kbd> tunnel included), plus <kbd>+</kbd>/<kbd>-</kbd> GPS speed, <kbd>G</kbd> GPS stop/go, <kbd>R</kbd> radar off/weak/medium/strong, <kbd>F</kbd> full speed (not paced to real time; also `--unpaced`), <kbd>F9</kbd> save state, <kbd>Esc</kbd> quit. |
 | `w53ga-headless` | Runs for a set emulated time without a window; writes screenshots (`--frame`, `--every`), saved states, audio (`--wav`), memory dumps, periodic memory and GPS readouts (`--peek`). Also writes HLE profiles (`--make-profile`). |
 | `w53ga-serve` | Tiny local web server for the browser version (127.0.0.1 only), with the Wi-Fi relay. |
 | `rl78-run` | The RL78 controller on its own: disassembler, traces, SFR access report (a development tool). |
@@ -206,7 +206,7 @@ Measured with the unit's own software on the development machine.
 | Area | State |
 |---|---|
 | Boot | Power-on reset → boot loader → startup screens → map in about 45 s of emulated time, with the real controller program; no scripted messages or forced state. |
-| Speed | Depends on what the unit is doing. Natively: about 1.2× real time while booting, about 0.5× while driving through the dense map of central Tokyo (the unit's map drawing is CPU-heavy). The browser runs at roughly half the native speed. Both front ends pace to real time when they can. |
+| Speed | Depends on what the unit is doing. Natively (Ryzen 7 7700X): about 1.6-2× real time while booting and on the map, 0.75-1× while driving through the dense map of central Tokyo (the unit's map drawing is CPU-heavy), about 5× with the from-scratch firmware (see [docs/performance.md](docs/performance.md)). The browser runs at roughly half the native speed. Both front ends pace to real time when they can; `w53ga --unpaced` or <kbd>F</kbd> runs at full speed. |
 | Display | All layer formats, blending, fades, the video plane; the unit's map, menus, standby screens and camera screens render. 2D drawing through [HLE](#hle-profiles). |
 | Controller | The real controller program runs: link handshake, mode changes, settings, GPS handling, warning database in its serial flash. |
 | GPS | The map follows the emulated receiver; routes, manual driving, map clicks. In a tunnel (GPS cut) the unit dead-reckons from the gyro and the G-sensor or OBD-II speed, shows "- - -" for the speed without OBD-II and switches to night colours, as described in [docs/gps-loss.md](docs/gps-loss.md). |
@@ -246,6 +246,14 @@ Measured with the unit's own software on the development machine.
 - **Front-end independence.** The library has no window, audio or file-system dependency in its core; SD card reads
   go through a pluggable reader so the browser can serve them from `File` objects.
 - **Saved states** serialise both CPUs, every peripheral model and all memories.
+- **Speed without shortcuts.** The SH-2A decodes each opcode once into a handler table and runs flash code from
+  decoded blocks, instruction after instruction up to the next peripheral tick. Loops that only wait for an interrupt
+  (they read memory or a timer's status flag, store nothing new and touch no other device) are checked as they run:
+  once a pass is shown to repeat exactly, the peripherals are ticked as usual without executing the loop, and the CPU
+  is put in the exact state it would have reached at the tick where anything the loop depends on changes. The RL78
+  controller does the same with its own wait loops. The run is the same, instruction for instruction and tick for tick,
+  as executing everything (`W53GA_SPIN=0` turns this off for comparison). Measurements and method:
+  [docs/performance.md](docs/performance.md).
 
 ## HLE profiles
 

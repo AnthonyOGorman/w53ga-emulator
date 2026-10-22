@@ -42,6 +42,63 @@ pub struct Companion {
     /// Internal resets taken.
     #[serde(skip)]
     pub resets: u64,
+    /// Fast-forward through busy-wait loops whose passes provably repeat (`spin_record`): on unless W53GA_SPIN=0.
+    #[serde(skip, default = "spin_default")]
+    pub spin_skip: bool,
+    #[serde(skip)]
+    spin: RlSpin,
+}
+
+fn spin_default() -> bool { std::env::var("W53GA_SPIN").map_or(true, |v| v != "0") }
+
+// ---------- busy-wait loops ----------
+//
+// The controller program often waits in a loop that only reads RAM until an interrupt handler changes it. When one pass
+// through such a loop returns to the same registers (the register banks and SP, PSW, CS, ES, PMC), makes no SFR
+// access and every store in it writes the value already in RAM, the next pass is the same computation on the same
+// inputs, and so is every pass after it until an interrupt is accepted (nothing else can change RAM). So until then
+// each instruction's effect is known: the registers it leaves, its clock count. `run_steps` then applies those
+// instead of executing (whole passes at once where no peripheral event or the end of the clock budget falls inside),
+// and stops before the instruction at which an interrupt would be accepted. The run is the same as executing them.
+
+/// Steps per pass at most for a loop to be fast-forwarded, and advance calls to wait at most between attempts.
+const SPIN_MAX: usize = 64;
+const SPIN_MAX_BACKOFF: u32 = 4096;
+const SPIN_IDLE: u8 = 0;
+const SPIN_PASS1: u8 = 1;
+const SPIN_PASS2: u8 = 2;
+const SPIN_ACTIVE: u8 = 3;
+
+/// The controller state a busy-wait loop changes: registers, PC; with `cur_pc` and the clocks of the instruction that
+/// led to it (raw, and as consumed: at least 1).
+#[derive(Clone, Copy, Default)]
+struct RlState { banks: [u8; 32], hi: [u8; 8], pc: u32, cur_pc: u32, cycles: u32, used: u32 }
+
+impl RlState {
+    fn of(c: &Rl78) -> RlState { let (banks, hi) = c.spin_regs(); RlState { banks, hi, pc: c.pc, cur_pc: c.cur_pc, cycles: c.cycles, used: c.cycles.max(1) } }
+    fn same(&self, o: &RlState) -> bool { self.banks == o.banks && self.hi == o.hi && self.pc == o.pc }
+}
+
+/// State of the controller's busy-wait fast-forward; not part of saved states.
+#[derive(Default)]
+struct RlSpin {
+    mode: u8,
+    /// `advance` calls until the next attempt, and the current wait after failures.
+    wait: u32,
+    backoff: u32,
+    /// Where the attempt started, steps so far, steps per pass, SFR accesses and accepted interrupts at the start.
+    s0: RlState,
+    n: usize,
+    k: usize,
+    bus: u64,
+    accepted: u64,
+    /// One pass: the state after each of its steps; the next one (phase) and the clocks of a pass.
+    states: Vec<RlState>,
+    phase: usize,
+    cycles: u64,
+    tries: u64,
+    found: u64,
+    skipped: u64,
 }
 
 impl Companion {
@@ -57,10 +114,11 @@ impl Companion {
         let mut g13 = G13::default();
         g13.logging = false;
         Companion { cpu: Rl78::new(flash), g13, frac: 0, scif_cursor: 0, fault: None, log_link: std::env::var_os("AR_LINK_LOG").is_some(), pending: [Vec::new(), Vec::new()], frames: Vec::new(), now: 0,
-            breaks: std::env::var("AR_RL78_BREAK").map(|v| v.split(',').filter_map(|x| u32::from_str_radix(x, 16).ok()).collect()).unwrap_or_default(), gnss: None, radar: Default::default(), taps: None, pc_hist: None, resets: 0 }
+            breaks: std::env::var("AR_RL78_BREAK").map(|v| v.split(',').filter_map(|x| u32::from_str_radix(x, 16).ok()).collect()).unwrap_or_default(), gnss: None, radar: Default::default(), taps: None, pc_hist: None, resets: 0, spin_skip: spin_default(), spin: Default::default() }
     }
     /// Re-read the debug environment switches (after loading a saved state).
     pub fn refresh_debug_env(&mut self) {
+        self.spin_stop();
         self.log_link = std::env::var_os("AR_LINK_LOG").is_some();
         self.breaks = std::env::var("AR_RL78_BREAK").map(|v| v.split(',').filter_map(|x| u32::from_str_radix(x, 16).ok()).collect()).unwrap_or_default();
         self.g13.fsl_log = std::env::var_os("AR_FSL_LOG").is_some();
@@ -73,6 +131,7 @@ impl Companion {
     /// as it is now (after self-programming), RAM keeps its contents, on-chip peripherals return to their reset state and
     /// RESF reports WDTRF. The external SPI flash, the pins and the analog inputs are outside the chip and carry over.
     pub fn chip_reset(&mut self) {
+        self.spin_stop();
         let flash = std::mem::take(&mut self.cpu.flash);
         let (ram, data_flash) = (std::mem::take(&mut self.cpu.ram), std::mem::take(&mut self.cpu.data_flash));
         let mut cpu = Rl78::new(flash);
@@ -136,6 +195,124 @@ impl Companion {
         }
     }
 
+    /// Instructions while the controller runs (not halted or stopped, no debugging) and clocks remain: the same steps
+    /// as `advance`'s loop, with its clock budget kept in a register. Returns to that loop when it ends, when the CPU
+    /// halts or stops, on a fault and on an internal reset.
+    #[inline(never)]
+    fn run_steps(&mut self) {
+        let mut frac = self.frac;
+        if self.spin_skip && self.spin.mode == SPIN_IDLE {
+            if self.spin.wait > 0 { self.spin.wait -= 1; } else { self.spin_start(); }
+        }
+        loop {
+            if self.spin.mode == SPIN_ACTIVE {
+                // the check `service` makes before an instruction: an interrupt to accept ends the fast-forward there
+                if !self.g13.interrupt_due(&self.cpu) {
+                    self.spin_forward(&mut frac);
+                    if frac < DEN as i64 { break; }
+                    continue;
+                }
+                self.spin_stop();
+            }
+            if let Err(e) = self.g13.step(&mut self.cpu) { eprintln!("[rl78] fault {e:?}"); self.fault = Some(e); }
+            if self.g13.reset_request { self.frac = frac; self.chip_reset(); return; }
+            let c = self.cpu.cycles.max(1) as u64;
+            frac -= (c * DEN) as i64;
+            self.g13.tick(c);
+            if self.spin.mode != SPIN_IDLE { self.spin_record(); }
+            if frac < DEN as i64 || self.cpu.halted || self.cpu.stopped || self.fault.is_some() { break; }
+        }
+        self.frac = frac;
+    }
+
+    /// Start looking for a busy-wait loop from the current instruction (the steps run as usual meanwhile).
+    fn spin_start(&mut self) {
+        if self.cpu.pc >= 0x80000 || self.cpu.halted || self.cpu.stopped { return self.spin_fail(); }
+        self.cpu.wnoisy = false;
+        let s = &mut self.spin;
+        (s.s0, s.mode, s.n, s.bus, s.accepted) = (RlState::of(&self.cpu), SPIN_PASS1, 0, self.g13.bus_accesses, self.g13.accepted);
+        s.tries += 1;
+    }
+
+    /// After a step while looking for a loop: first a pass of at most `SPIN_MAX` steps that returns to the registers
+    /// it started from, then one more such pass with the store check on, recording the state after each step. The
+    /// loop qualifies when that pass also returns to them, every store wrote the value already in RAM, IE and ISP
+    /// stayed the same, and neither pass made an SFR access, accepted an interrupt, halted, faulted or left code flash.
+    fn spin_record(&mut self) {
+        let ok = !self.cpu.halted && !self.cpu.stopped && self.fault.is_none() && self.cpu.pc < 0x80000 && !self.cpu.wnoisy
+            && self.g13.bus_accesses == self.spin.bus && self.g13.accepted == self.spin.accepted;
+        if !ok { return self.spin_fail(); }
+        let st = RlState::of(&self.cpu);
+        let s = &mut self.spin;
+        s.n += 1;
+        if s.mode == SPIN_PASS1 {
+            if st.same(&s.s0) {
+                (s.k, s.n, s.mode) = (s.n, 0, SPIN_PASS2);
+                s.states.clear();
+                (self.cpu.wcheck, self.cpu.wnoisy) = (true, false);
+            } else if s.n >= SPIN_MAX { self.spin_fail(); }
+            return;
+        }
+        s.states.push(st);
+        if s.n < s.k { return; }
+        self.cpu.wcheck = false;
+        let ie = s.s0.hi[2] & 0x86;
+        if st.same(&s.s0) && s.states.iter().all(|x| x.hi[2] & 0x86 == ie) {
+            (s.mode, s.phase, s.backoff) = (SPIN_ACTIVE, 0, 1);
+            s.cycles = s.states.iter().map(|x| x.used as u64).sum();
+            s.found += 1;
+        } else { self.spin_fail(); }
+    }
+
+    /// No loop found here: try again after a wait that doubles with each failure.
+    fn spin_fail(&mut self) {
+        self.cpu.wcheck = false;
+        let s = &mut self.spin;
+        s.mode = SPIN_IDLE;
+        s.backoff = (s.backoff * 2).clamp(1, SPIN_MAX_BACKOFF);
+        s.wait = s.backoff;
+    }
+
+    /// End a fast-forward (the controller's state is always exact) or an attempt; look again at the next call.
+    fn spin_stop(&mut self) {
+        self.cpu.wcheck = false;
+        let s = &mut self.spin;
+        (s.mode, s.wait, s.backoff) = (SPIN_IDLE, 0, 1);
+    }
+
+    /// Fast-forward the verified loop by one instruction, after as many whole passes as the clock budget allows
+    /// without reaching the next peripheral event, as `run_steps` would have executed them.
+    fn spin_forward(&mut self, frac: &mut i64) {
+        let den = DEN as i64;
+        let k = self.spin.states.len();
+        if self.spin.phase == 0 {
+            // whole passes: each instruction must start with at least DEN left, and none may reach the next event
+            let (c, last) = (self.spin.cycles as i64, self.spin.states[k - 1].used as i64);
+            let by_frac = (*frac + (last - 1) * den) / (c * den);
+            let to_event = self.g13.cycles_to_event();
+            let by_event = if to_event == 0 { 0 } else { ((to_event - 1) / c as u64).min(i64::MAX as u64) as i64 };
+            let m = by_frac.min(by_event);
+            if m > 0 {
+                self.cpu.steps += m as u64 * k as u64;
+                *frac -= m * c * den;
+                self.g13.add_cycles(m as u64 * c as u64);
+                self.spin.skipped += m as u64 * k as u64;
+                if *frac < den { return; }
+            }
+        }
+        let s = self.spin.states[self.spin.phase];
+        self.cpu.set_spin_regs(&s.banks, &s.hi);
+        (self.cpu.pc, self.cpu.cur_pc, self.cpu.cycles) = (s.pc, s.cur_pc, s.cycles);
+        self.cpu.steps += 1;
+        *frac -= s.used as i64 * den;
+        self.g13.tick(s.used as u64);
+        self.spin.phase = (self.spin.phase + 1) % k;
+        self.spin.skipped += 1;
+    }
+
+    /// Busy-wait fast-forward statistics: (attempts, loops found, instructions not executed).
+    pub fn spin_stats(&self) -> (u64, u64, u64) { (self.spin.tries, self.spin.found, self.spin.skipped) }
+
     /// Advance by `p0` SH-2A peripheral clocks and exchange link bytes with SCIF7.
     pub fn advance(&mut self, p0: u64, scif: Option<&mut Scif>) {
         self.now += p0;
@@ -161,6 +338,8 @@ impl Companion {
                     continue;
                 }
             }
+            if !debug && !self.cpu.halted && !self.cpu.stopped { self.run_steps(); continue; }
+            if self.spin.mode != SPIN_IDLE { self.spin_stop(); }
             if let Err(e) = self.g13.step(&mut self.cpu) { eprintln!("[rl78] fault {e:?}"); self.fault = Some(e); }
             if self.g13.reset_request { self.chip_reset(); continue; }
             let c = self.cpu.cycles.max(1) as u64;

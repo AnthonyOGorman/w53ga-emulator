@@ -108,6 +108,11 @@ fn main() {
     let done = (m.steps - start) as f64 / P0_HZ;
     println!("ran {done:.2} s of emulated time in {secs:.2} s ({:.2}x real time), {} interrupts", done / secs.max(1e-9), m.interrupts);
     if let Err(e) = &result { println!("STOPPED at t={:.3}s pc {:08x}: {e:?}\n  recent:{}", m.steps as f64 / P0_HZ, m.cpu.pc, m.dump_history()); }
+    if std::env::var_os("W53GA_SPIN_STATS").is_some() {
+        let (tries, found, skipped) = m.spin_stats();
+        println!("busy-wait loops: {found} fast-forwarded ({tries} attempts), {skipped} instructions not executed; idle loop: {:.1}% of the time", 100.0 * m.idle_skipped as f64 / (m.steps - start).max(1) as f64);
+        if let Some(c) = &m.board.companion { let (t, f, s) = c.spin_stats(); println!("controller busy-wait loops: {f} fast-forwarded ({t} attempts), {s} instructions not executed"); }
+    }
     if m.gfx_hle && m.hooks.rgah_range.is_some() { println!("2D graphics: {} fills, {} images, {} blits, {} masked, {} pixels", m.gfx.fills, m.gfx.images, m.gfx.blits, m.gfx.masks, m.gfx.pixels); }
     if let Some(f) = m.detected() {
         let at = |a: Option<u32>, t: u64| a.map_or("not seen".to_string(), |a| format!("{a:#x} (t={:.3}s)", t as f64 / P0_HZ));

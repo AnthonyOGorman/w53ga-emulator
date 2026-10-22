@@ -12,6 +12,7 @@ impl Mmio for Board {
     fn read(&mut self, pc: u32, a: u32, n: usize) -> u64 {
         self.irq_dirty = true;
         self.mmio_accesses += 1;
+        if let Some(l) = &mut self.spin_log { l.push((a, n, false)); }
         if crate::periph::nor::Nor::handles(a) {
             if let Some(v) = self.nor.mode_read(a) { return match n { 4 => ((v as u64) << 16) | v as u64, 1 => (v & 0xFF) as u64, _ => v as u64 }; }
         }
@@ -25,6 +26,7 @@ impl Mmio for Board {
     fn write(&mut self, pc: u32, a: u32, n: usize, v: u64) {
         self.irq_dirty = true;
         self.mmio_accesses += 1;
+        if let Some(l) = &mut self.spin_log { l.push((a, n, true)); }
         mmio_log(self.now, pc, a, n, v);
         if !Board::write(self, a, n, v) {
             // Unmodelled register: the store is accepted and remembered, nothing else happens.
@@ -123,13 +125,23 @@ pub struct Machine {
     /// states (`save_state_to`). While it runs, the CPU carries its trace (`Cpu::trace`).
     #[serde(skip)]
     pub detect: Option<Box<crate::detect::Detector>>,
+    /// Decoded code in flash for `Cpu::run`.
+    #[serde(skip)]
+    blocks: crate::cpu::BlockCache,
+    /// Fast-forward through busy-wait loops whose iterations provably repeat (`spin_try`): on unless W53GA_SPIN=0.
+    #[serde(skip, default = "spin_default")]
+    pub spin_skip: bool,
+    #[serde(skip)]
+    spin: Spin,
 }
+
+fn spin_default() -> bool { std::env::var("W53GA_SPIN").map_or(true, |v| v != "0") }
 
 impl Machine {
     pub fn from_checkpoint(flash: Vec<u8>, c: &Checkpoint) -> Result<Machine, String> {
         let mut cpu = Cpu::new(Memory::new(flash));
         c.apply(&mut cpu);
-        Ok(Machine { cpu, board: Board::from_checkpoint(c)?, steps: c.steps, interrupts: 0, history: [0; 64], hist_irq: [false; 64], hist_pos: 0, cpu_per_p0: 1, sub: 0, p0_batch: 1, call_counts: None, gfx_hle: false, gfx: Default::default(), hooks: Default::default(), idle_skip: false, idle_skipped: 0, irq_hist: Default::default(), stop_pc: std::env::var("AR_SH_STOP_PC").ok().and_then(|v| u32::from_str_radix(&v, 16).ok()), resets: 0, arg_log: arg_log_env(), debug_hooks: false, detect: None })
+        Ok(Machine { cpu, board: Board::from_checkpoint(c)?, steps: c.steps, interrupts: 0, history: [0; 64], hist_irq: [false; 64], hist_pos: 0, cpu_per_p0: 1, sub: 0, p0_batch: 1, call_counts: None, gfx_hle: false, gfx: Default::default(), hooks: Default::default(), idle_skip: false, idle_skipped: 0, irq_hist: Default::default(), stop_pc: std::env::var("AR_SH_STOP_PC").ok().and_then(|v| u32::from_str_radix(&v, 16).ok()), resets: 0, arg_log: arg_log_env(), debug_hooks: false, detect: None, blocks: Default::default(), spin_skip: spin_default(), spin: Default::default() })
     }
 
     /// The unit as power is applied: the chip's power-on reset state (`Checkpoint::power_on`), the flash image as
@@ -189,19 +201,7 @@ impl Machine {
         if let Some(power_on) = self.board.wdt.reset.take() { self.chip_reset(power_on).map_err(Stop::Model)?; }
         // Idle loop head named by the HLE profile: with interrupts unmasked and nothing deliverable, no task can become
         // ready, so only the peripherals advance until an interrupt is due.
-        if self.idle_skip && Some(self.cpu.pc) == self.hooks.idle_loop && self.cpu.imask() == 0 {
-            let deliverable = self.board.pending_request().is_some_and(|(_, l)| l > 0);
-            if !deliverable {
-                self.sub = 0; // the rest of this tick's instruction slots are idle too
-                self.board.p0_per_step = self.p0_batch as u64;
-                self.steps += self.p0_batch as u64;
-                self.idle_skipped += self.p0_batch as u64;
-                crate::prof::set(crate::prof::BOARD);
-                self.board.tick_with(&mut self.cpu.mem);
-                if let Some(f) = self.board.fault.take() { return Err(Stop::Model(f)); }
-                return Ok(());
-            }
-        }
+        if self.idle_now() { return self.idle_tick(); }
         if let Some((v, l)) = self.board.pending_request() {
             if l > self.cpu.imask() {
                 self.cpu.take_interrupt(&mut self.board, v, l, true).map_err(Stop::Cpu)?;
@@ -240,6 +240,24 @@ impl Machine {
         Ok(())
     }
 
+    /// At the idle loop head with interrupts unmasked and nothing deliverable (`step` then skips the CPU).
+    #[inline]
+    fn idle_now(&mut self) -> bool {
+        self.idle_skip && Some(self.cpu.pc) == self.hooks.idle_loop && self.cpu.imask() == 0 && !self.board.pending_request().is_some_and(|(_, l)| l > 0)
+    }
+
+    /// A tick of the peripherals with the CPU idle.
+    fn idle_tick(&mut self) -> Result<(), Stop> {
+        self.sub = 0; // the rest of this tick's instruction slots are idle too
+        self.board.p0_per_step = self.p0_batch as u64;
+        self.steps += self.p0_batch as u64;
+        self.idle_skipped += self.p0_batch as u64;
+        crate::prof::set(crate::prof::BOARD);
+        self.board.tick_with(&mut self.cpu.mem);
+        if let Some(f) = self.board.fault.take() { return Err(Stop::Model(f)); }
+        Ok(())
+    }
+
     /// The development hooks AR_SH_STOP_PC and AR_SH_ARG_LOG, checked before an instruction only while a hook is set
     /// (`debug_hooks`, refreshed by `run`; --count-calls is counted in `step`).
     #[cold]
@@ -261,13 +279,14 @@ impl Machine {
         let c = Checkpoint::power_on()?;
         let (pc_v, sp_v) = if power_on { (0, 4) } else { (8, 12) };
         let rd = |m: &Memory, a: usize| u32::from_be_bytes(m.flash[a..a + 4].try_into().unwrap());
-        let mem = std::mem::replace(&mut self.cpu.mem, Memory { flash_cmd_mode: false, flash: Vec::new(), sdram: Vec::new(), oram: Vec::new() });
+        let mem = std::mem::replace(&mut self.cpu.mem, Memory { flash_cmd_mode: false, code_gen: 0, ext_writes: 0, flash: Vec::new(), sdram: Vec::new(), oram: Vec::new() });
         let mut cpu = Cpu::new(mem);
         cpu.pc = rd(&cpu.mem, pc_v);
         cpu.r[15] = rd(&cpu.mem, sp_v);
         cpu.float_mode = self.cpu.float_mode;
         cpu.mem.flash_cmd_mode = false;
         self.cpu = cpu;
+        self.blocks.invalidate();
         self.board.chip_reset(&c)?;
         self.resets += 1;
         eprintln!("[reset] watchdog {} reset at step {}: pc {:08x} sp {:08x}", if power_on { "power-on" } else { "manual" }, self.steps, self.cpu.pc, self.cpu.r[15]);
@@ -436,12 +455,17 @@ impl Machine {
     /// Save the state into any writer (gzip-compressed bincode with the version header).
     pub fn save_state_to(&self, w: impl std::io::Write) -> Result<(), String> {
         let mut z = flate2::write::GzEncoder::new(w, flate2::Compression::fast());
-        std::io::Write::write_all(&mut z, STATE_MAGIC).map_err(|e| e.to_string())?;
-        bincode::serialize_into(&mut z, self).map_err(|e| e.to_string())?;
-        // Runtime HLE detection results follow the machine as an optional trailer (older readers ignore it).
-        if let Some(d) = &self.detect {
-            std::io::Write::write_all(&mut z, DETECT_MAGIC).map_err(|e| e.to_string())?;
-            bincode::serialize_into(&mut z, &d.found).map_err(|e| e.to_string())?;
+        {
+            // bincode writes byte arrays (the memories) one byte per call: buffer them before the compressor
+            let mut b = std::io::BufWriter::with_capacity(1 << 16, &mut z);
+            std::io::Write::write_all(&mut b, STATE_MAGIC).map_err(|e| e.to_string())?;
+            bincode::serialize_into(&mut b, self).map_err(|e| e.to_string())?;
+            // Runtime HLE detection results follow the machine as an optional trailer (older readers ignore it).
+            if let Some(d) = &self.detect {
+                std::io::Write::write_all(&mut b, DETECT_MAGIC).map_err(|e| e.to_string())?;
+                bincode::serialize_into(&mut b, &d.found).map_err(|e| e.to_string())?;
+            }
+            std::io::Write::flush(&mut b).map_err(|e| e.to_string())?;
         }
         z.finish().map_err(|e| e.to_string())?;
         Ok(())
@@ -455,7 +479,8 @@ impl Machine {
 
     /// Load a state from any reader (as written by `save_state_to`).
     pub fn load_state_from(r: impl std::io::Read) -> Result<Machine, String> {
-        let mut z = flate2::read::GzDecoder::new(r);
+        // bincode reads byte arrays one byte per call: buffer the decompressed stream
+        let mut z = std::io::BufReader::with_capacity(1 << 16, flate2::read::GzDecoder::new(r));
         let mut magic = [0u8; 16];
         std::io::Read::read_exact(&mut z, &mut magic).map_err(|e| e.to_string())?;
         if &magic != STATE_MAGIC { return Err(format!("not a state of this emulator version (header {:?})", String::from_utf8_lossy(&magic))); }
@@ -484,11 +509,224 @@ impl Machine {
         out
     }
 
-    /// Run for `n` peripheral clocks (P0 ticks).
+    /// Run for `n` peripheral clocks (P0 ticks). The same as calling `step` until then, but runs of instructions that
+    /// need none of `step`'s checks go through `Cpu::run` (see `run_fast`).
     pub fn run(&mut self, n: u64) -> Result<(), Stop> {
         self.debug_hooks = self.stop_pc.is_some() || !self.arg_log.is_empty() || self.call_counts.is_some();
         let end = self.steps + n;
-        while self.steps < end { self.step()?; }
+        self.blocks.invalidate();
+        self.spin.active = false; // anything may have been changed from outside since the last call
+        while self.steps < end {
+            if self.debug_hooks || self.board.wdt.reset.is_some() || self.detect.as_ref().is_some_and(|d| d.verify.is_some()) { self.step()?; }
+            else if self.idle_now() { self.idle_tick()?; } // as `step` would (no reset is pending)
+            else if self.spin.active { self.spin_forward(end)?; }
+            else {
+                self.run_fast()?;
+                if self.sub == 0 && self.spin_skip && self.cpu.trace.is_none() && self.cpu.watch.is_none() && self.steps < end { self.spin_try(end)?; }
+            }
+        }
+        Ok(())
+    }
+
+    // ---------- busy-wait loops ----------
+    //
+    // Programs often wait in a loop that only reads memory until an interrupt handler changes it (a tick counter, a
+    // receive ring, a flag), or that polls a timer's status register until a compare match. When one pass through such
+    // a loop leaves every CPU register as it found it, every store it makes writes the value already there, and its
+    // only device accesses are reads of plain register latches (no device model involved, `Board::latch_only`), the
+    // next pass is the same computation on the same inputs, and so is every pass after it until something outside the
+    // CPU acts: an interrupt is accepted, a device (DMA, the JPEG unit, the camera, NOR programming) writes memory, or a
+    // tick changes one of the latches it reads. So between those events the CPU's state at any instruction count is
+    // known without executing anything: the peripherals are ticked as usual (exactly as `run_fast` would tick them,
+    // every `cpu_per_p0 * p0_batch` instructions), and when the fast-forward ends the CPU is put in the state it has at
+    // that point of the loop. The run is the same as executing every instruction.
+
+    /// After a peripheral tick: look for a busy-wait loop from the current instruction, unless backing off after
+    /// failed attempts. Instructions run through `step` meanwhile, so nothing is skipped while looking.
+    fn spin_try(&mut self, end: u64) -> Result<(), Stop> {
+        if self.spin.wait > 0 { self.spin.wait -= 1; return Ok(()); }
+        self.spin.tries += 1;
+        if self.spin_find(end)? {
+            self.spin.found += 1;
+            self.spin.backoff = 1;
+            self.spin.active = true;
+        } else {
+            self.spin.backoff = (self.spin.backoff * 2).clamp(1, SPIN_MAX_BACKOFF);
+            self.spin.wait = self.spin.backoff;
+        }
+        Ok(())
+    }
+
+    /// Can the next instruction be part of a fast-forwarded loop: nothing `step` checks before an instruction applies
+    /// (an interrupt to accept, the idle loop, a hooked entry point, a pending reset) and the instruction (with its
+    /// delay slot) is not one of those whose effects `SpinRegs` and the store check do not cover (`Cpu::spin_safe`).
+    fn spin_can_step(&mut self, end: u64) -> bool {
+        if self.steps >= end || self.board.wdt.reset.is_some() || self.debug_hooks { return false; }
+        let imask = self.cpu.imask();
+        if self.board.pending_request().is_some_and(|(_, l)| l > imask) { return false; }
+        let pc = self.cpu.pc;
+        if self.idle_skip && Some(pc) == self.hooks.idle_loop && imask == 0 { return false; }
+        if self.gfx_hle { if let Some((lo, hi)) = self.hooks.rgah_range { if pc >= lo && pc <= hi && self.hooks.rgah.iter().any(|h| h.0 == pc) { return false; } } }
+        self.cpu.spin_safe(pc)
+    }
+
+    /// One `step` while looking for a loop, noting the latches it read in `reads`; false if it did anything a
+    /// fast-forwarded loop may not do (an access to a device model, any device write, an interrupt, SLEEP) or a device
+    /// wrote memory meanwhile (in a tick).
+    fn spin_step(&mut self, mark: &(u64, u64, u64), reads: &mut Vec<usize>) -> Result<bool, Stop> {
+        self.board.spin_log.get_or_insert_with(Vec::new).clear();
+        self.step()?;
+        if self.cpu.sleeping || (self.interrupts, self.cpu.mem.ext_writes, self.cpu.mem.code_gen) != *mark { return Ok(false); }
+        let log = self.board.spin_log.take().unwrap_or_default();
+        let ok = log.iter().all(|&(a, n, w)| match (w, self.board.latch_only(a, n)) { (false, Some(i)) => { reads.push(i); true } _ => false });
+        self.board.spin_log = Some(log);
+        Ok(ok)
+    }
+
+    /// Run on from the current instruction looking for a pass of at most `SPIN_MAX` steps that returns to the same
+    /// registers, then run one more such pass recording the registers before each step, with the store check on. True
+    /// when the second pass also came back to the same registers, changed no memory (every store wrote the value
+    /// already there) and kept SR.IMASK: the loop is then ready to be fast-forwarded from phase 0 (where the CPU is).
+    fn spin_find(&mut self, end: u64) -> Result<bool, Stop> {
+        let r = self.spin_find_with(end);
+        self.board.spin_log = None;
+        self.cpu.set_store_check(false);
+        r
+    }
+
+    fn spin_find_with(&mut self, end: u64) -> Result<bool, Stop> {
+        let s0 = SpinRegs::of(&self.cpu);
+        let mark = (self.interrupts, self.cpu.mem.ext_writes, self.cpu.mem.code_gen);
+        let mut reads = Vec::new();
+        let mut k = 0;
+        for i in 1..=SPIN_MAX {
+            if !self.spin_can_step(end) || !self.spin_step(&mark, &mut reads)? { return Ok(false); }
+            if self.cpu.pc == s0.pc && SpinRegs::of(&self.cpu) == s0 { k = i; break; }
+        }
+        if k == 0 { return Ok(false); }
+        let mut states = std::mem::take(&mut self.spin.states);
+        let mut cur = std::mem::take(&mut self.spin.cur);
+        let mut pre = std::mem::take(&mut self.spin.pre);
+        (states.clear(), cur.clear(), pre.clear(), reads.clear());
+        pre.push(0);
+        self.cpu.set_store_check(true);
+        let mut ok = true;
+        for _ in 0..k {
+            if !self.spin_can_step(end) { ok = false; break; }
+            states.push(SpinRegs::of(&self.cpu));
+            if !self.spin_step(&mark, &mut reads)? { ok = false; break; }
+            cur.push(self.cpu.cur_pc);
+            pre.push(reads.len() as u64);
+        }
+        ok = ok && !self.cpu.wnoisy;
+        let imask = (s0.sr >> 4) & 15;
+        ok = ok && SpinRegs::of(&self.cpu) == s0 && states.iter().all(|s| (s.sr >> 4) & 15 == imask);
+        if ok {
+            self.spin.phase = 0;
+            self.spin.imask = imask;
+            self.spin.ext = mark.1;
+            self.spin.gen = mark.2;
+            // every latch the pass read has had all its reads' effects: further reads from these states change nothing
+            reads.sort_unstable();
+            reads.dedup();
+            self.spin.latches = reads.iter().map(|&i| (i, self.board.latch_state(i))).collect();
+        }
+        self.spin.states = states;
+        self.spin.cur = cur;
+        self.spin.pre = pre;
+        Ok(ok)
+    }
+
+    /// Latch reads by `n` passes' worth of steps of the loop from phase `p` (`Spin::pre`).
+    fn spin_reads(&self, p: usize, n: usize) -> u64 {
+        let pre = &self.spin.pre;
+        let k = pre.len() - 1;
+        let (laps, e) = ((n / k) as u64, p + n % k);
+        laps * pre[k] + if e <= k { pre[e] - pre[p] } else { pre[k] - pre[p] + pre[e - k] }
+    }
+
+    /// Fast-forward the verified loop: each tick's remaining instructions are passes (or parts of passes) through the
+    /// loop, so only the peripherals are ticked, as `run_fast` would tick them after executing those instructions.
+    /// Stops after the first tick at which the loop may no longer repeat (an interrupt it would accept, memory written
+    /// by a device, a latch it reads changed, a reset or a model fault pending) or the run ends; the CPU then gets the
+    /// state of that point.
+    fn spin_forward(&mut self, end: u64) -> Result<(), Stop> {
+        let limit = (self.cpu_per_p0 * self.p0_batch) as usize;
+        let k = self.spin.states.len();
+        loop {
+            let n = limit - self.sub as usize;
+            // the PC history as executing those instructions would leave it (the last 64 of them)
+            let first = n.saturating_sub(64);
+            let mut q = (self.spin.phase + first) % k;
+            for i in first..n {
+                let at = (self.hist_pos + i) & 63;
+                self.history[at] = self.spin.states[q].pc;
+                self.hist_irq[at] = false;
+                q += 1;
+                if q == k { q = 0; }
+            }
+            self.hist_pos += n;
+            self.board.mmio_accesses += self.spin_reads(self.spin.phase, n);
+            self.spin.phase = (self.spin.phase + n) % k;
+            self.spin.skipped += n as u64;
+            self.sub = 0;
+            self.board.p0_per_step = self.p0_batch as u64;
+            self.steps += self.p0_batch as u64;
+            crate::prof::set(crate::prof::BOARD);
+            self.board.tick_with(&mut self.cpu.mem);
+            if let Some(f) = self.board.fault.take() { self.spin_stop(); return Err(Stop::Model(f)); }
+            let imask = self.spin.imask;
+            if self.steps >= end || self.board.wdt.reset.is_some() || self.cpu.mem.ext_writes != self.spin.ext || self.cpu.mem.code_gen != self.spin.gen
+                || self.spin.latches.iter().any(|&(i, s)| self.board.latch_state(i) != s)
+                || self.board.pending_request().is_some_and(|(_, l)| l > imask) {
+                self.spin_stop();
+                return Ok(());
+            }
+        }
+    }
+
+    /// End a fast-forward: the CPU registers of the current phase (before its instruction), and `cur_pc` as the
+    /// instruction before it left it. Look again for a loop at the next tick.
+    fn spin_stop(&mut self) {
+        let (p, k) = (self.spin.phase, self.spin.states.len());
+        self.spin.states[p].put(&mut self.cpu);
+        self.cpu.cur_pc = self.spin.cur[(p + k - 1) % k];
+        self.spin.active = false;
+        self.spin.wait = 0;
+        self.spin.backoff = 1;
+    }
+
+    /// Busy-wait fast-forward statistics: (attempts, loops found, instructions not executed).
+    pub fn spin_stats(&self) -> (u64, u64, u64) { (self.spin.tries, self.spin.found, self.spin.skipped) }
+
+    /// Instructions up to the next peripheral tick, as `step` would run them: the CPU runs on alone while nothing
+    /// that `step` checks before an instruction can change, which needs a device access (then the CPU stops after that
+    /// instruction) or a tick (the budget ends there). Whenever a check applies to the next instruction (idle loop, an
+    /// interrupt to accept, a hooked entry point), that step is left to `step`.
+    fn run_fast(&mut self) -> Result<(), Stop> {
+        let limit = self.cpu_per_p0 * self.p0_batch;
+        let irq_level = self.board.pending_request().map_or(0, |(_, l)| l);
+        let idle_pc = if self.idle_skip { self.hooks.idle_loop.unwrap_or(1) } else { 1 };
+        let (hooks, hooks_range) = match self.hooks.rgah_range { Some(r) if self.gfx_hle => (&self.hooks.rgah[..], r), _ => (&[][..], (1, 0)) };
+        let mut lim = crate::cpu::RunLimits { budget: limit - self.sub, idle_pc, irq_level, hooks, hooks_range, history: &mut self.history, hist_irq: &mut self.hist_irq, hist_pos: &mut self.hist_pos };
+        crate::prof::set(crate::prof::CPU);
+        let (done, r) = self.cpu.run(&mut self.board, &mut lim, &mut self.blocks);
+        self.sub += done;
+        match r.map_err(Stop::Cpu)? {
+            crate::cpu::RunExit::Budget => {}
+            crate::cpu::RunExit::Check => return self.step(),
+            crate::cpu::RunExit::After(pc0) => {
+                if self.cpu.trace.is_some() { self.detect_check(pc0); }
+                if self.cpu_per_p0 > 1 { self.board.flush_deferred(&mut self.cpu.mem); }
+            }
+        }
+        if self.sub < limit { return Ok(()); }
+        self.sub = 0;
+        self.board.p0_per_step = self.p0_batch as u64;
+        self.steps += self.p0_batch as u64;
+        crate::prof::set(crate::prof::BOARD);
+        self.board.tick_with(&mut self.cpu.mem);
+        if let Some(f) = self.board.fault.take() { return Err(Stop::Model(f)); }
         Ok(())
     }
 
@@ -537,6 +775,49 @@ impl Machine {
 
 /// Instructions a speculative exploration may run (`Machine::speculate`).
 const SPEC_BUDGET: u32 = 400_000;
+
+/// Busy-wait loops of at most this many steps per pass are fast-forwarded (`Machine::spin_find`).
+const SPIN_MAX: usize = 1024;
+/// Ticks to wait at most between attempts to find one after failed attempts.
+const SPIN_MAX_BACKOFF: u32 = 4096;
+
+/// State of the busy-wait fast-forward (`Machine::spin_try`); not part of saved states.
+#[derive(Default)]
+struct Spin {
+    /// Ticks until the next attempt, and the current wait after failures (doubles up to `SPIN_MAX_BACKOFF`).
+    wait: u32,
+    backoff: u32,
+    /// A verified loop is ready or being fast-forwarded.
+    active: bool,
+    /// One pass of the loop: the registers before each of its steps, and `cur_pc` after each.
+    states: Vec<SpinRegs>,
+    cur: Vec<u32>,
+    /// Latch reads before each step of the pass (prefix sums, `k + 1` entries), and the latches read with their state.
+    pre: Vec<u64>,
+    latches: Vec<(usize, (u64, u64, bool))>,
+    /// Position in the pass (the next step), SR.IMASK throughout, and memory's device-write and code generations.
+    phase: usize,
+    imask: u32,
+    ext: u64,
+    gen: u64,
+    tries: u64,
+    found: u64,
+    skipped: u64,
+}
+
+/// The CPU registers a busy-wait loop can change or depend on (with memory); the others it cannot touch
+/// (`Cpu::spin_safe` excludes the instructions that do).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SpinRegs { r: [u32; 16], fr: [u32; 16], sr: u32, gbr: u32, vbr: u32, mach: u32, macl: u32, pr: u32, pc: u32, tbr: u32, fpscr: u32, fpul: u32 }
+
+impl SpinRegs {
+    fn of(c: &Cpu) -> SpinRegs {
+        SpinRegs { r: c.r, fr: c.fr, sr: c.sr, gbr: c.gbr, vbr: c.vbr, mach: c.mach, macl: c.macl, pr: c.pr, pc: c.pc, tbr: c.tbr, fpscr: c.fpscr, fpul: c.fpul }
+    }
+    fn put(&self, c: &mut Cpu) {
+        (c.r, c.fr, c.sr, c.gbr, c.vbr, c.mach, c.macl, c.pr, c.pc, c.tbr, c.fpscr, c.fpul) = (self.r, self.fr, self.sr, self.gbr, self.vbr, self.mach, self.macl, self.pr, self.pc, self.tbr, self.fpscr, self.fpul);
+    }
+}
 
 /// The CPU state saved around a speculative exploration (everything but memory and the detection trace).
 struct CpuRegs { r: [u32; 16], sr: u32, gbr: u32, vbr: u32, mach: u32, macl: u32, pr: u32, pc: u32, tbr: u32, fpscr: u32, fpul: u32, fr: [u32; 16], banks: [crate::cpu::Bank; 15], sleeping: bool, cur_pc: u32, bank_anomalies: u64 }

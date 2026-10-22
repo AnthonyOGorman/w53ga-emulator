@@ -305,12 +305,15 @@ impl Vdc4 {
         for k in 0..3 {
             let ri = self.index[&GR[k]];
             let (i_req, p_req) = (self.regs[ri].shadow & 1 != 0, self.regs[ri].shadow & 16 != 0);
-            let g = format!("G{k}");
+            // registers of groups "G{k}I", "G{k}P", "G{k}both", "G{k}mixed1", "G{k}mixed6" (compared without building
+            // the names: this runs at every Vsync)
+            let g = [b'G', b'0' + k as u8];
             for j in 0..self.regs.len() {
-                let grp = self.regs[j].group.clone();
-                if (grp == format!("{g}I") && i_req) || (grp == format!("{g}P") && p_req) || (grp == format!("{g}both") && i_req && p_req) { let m = self.regs[j].mask; self.copy(j, m); }
-                if grp == format!("{g}mixed1") { if i_req { self.copy(j, 0x10300); } if i_req && p_req { self.copy(j, 1); } }
-                if grp == format!("{g}mixed6") { if p_req { self.copy(j, 0x103F); } if i_req && p_req { self.copy(j, 0xF3FF_0000); } }
+                let grp = self.regs[j].group.as_bytes();
+                let kind = if grp.len() > 2 && grp[..2] == g { match &grp[2..] { b"I" => 1, b"P" => 2, b"both" => 3, b"mixed1" => 4, b"mixed6" => 5, _ => 0 } } else { 0 };
+                if (kind == 1 && i_req) || (kind == 2 && p_req) || (kind == 3 && i_req && p_req) { let m = self.regs[j].mask; self.copy(j, m); }
+                if kind == 4 { if i_req { self.copy(j, 0x10300); } if i_req && p_req { self.copy(j, 1); } }
+                if kind == 5 { if p_req { self.copy(j, 0x103F); } if i_req && p_req { self.copy(j, 0xF3FF_0000); } }
             }
             if p_req { self.clut_known[k] = true; }
             self.regs[ri].shadow &= !0x11;

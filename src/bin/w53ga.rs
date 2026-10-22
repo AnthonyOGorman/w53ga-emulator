@@ -6,7 +6,8 @@
 //!
 //! Keys: arrows = remote up/down/left/right, Enter = ENT, Backspace = BACK, F1..F5 = the other remote buttons
 //! (codes 0x10, 0x11, 0x12, 0x64, 0xFF), +/- = GPS speed ±10 km/h, G = GPS stop/go, R = radar off/weak/medium/strong,
-//! T = tunnel (GPS sky blocked, the drive goes on), P = pause, S = screenshot (BMP), F9 = save state, Esc = quit.
+//! T = tunnel (GPS sky blocked, the drive goes on), P = pause, S = screenshot (BMP), F = full speed (unpaced) on/off,
+//! F9 = save state, Esc = quit.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use minifb::{Key, KeyRepeat, Window, WindowOptions};
@@ -22,7 +23,7 @@ const W: usize = 400;
 const H: usize = 240;
 
 fn usage() -> ! {
-    eprintln!("usage: w53ga --flash FLASH.bin --rl78 CONTROLLER.bin [--sd FOLDER] [options]\n       w53ga --flash FLASH.bin --state SAVED.state [options]\n\n{OPTIONS_HELP}\n  --scale N               window scale (default 2)\n  --unpaced               run as fast as possible instead of real time\n  --save-flash FILE       on exit, write the NOR flash as it is then (e.g. after a software update)\n\nKeys: arrows/Enter/Backspace = remote, F1-F5 = other remote buttons, +/- GPS speed, G GPS stop/go, R radar off/weak/medium/strong, T tunnel,\n      P pause, S screenshot, F9 save state, Esc quit.");
+    eprintln!("usage: w53ga --flash FLASH.bin --rl78 CONTROLLER.bin [--sd FOLDER] [options]\n       w53ga --flash FLASH.bin --state SAVED.state [options]\n\n{OPTIONS_HELP}\n  --scale N               window scale (default 2)\n  --unpaced               run as fast as possible instead of real time (F switches while running)\n  --save-flash FILE       on exit, write the NOR flash as it is then (e.g. after a software update)\n\nKeys: arrows/Enter/Backspace = remote, F1-F5 = other remote buttons, +/- GPS speed, G GPS stop/go, R radar off/weak/medium/strong, T tunnel,\n      P pause, S screenshot, F full speed on/off, F9 save state, Esc quit.");
     std::process::exit(2)
 }
 
@@ -34,8 +35,8 @@ fn main() {
     let scale: usize = opt("--scale").map_or(2, |s| s.parse().unwrap_or(2)).clamp(1, 8);
     let options = Options::parse(&args).unwrap_or_else(|e| { eprintln!("{e}"); usage() });
     let mut m = options.build().unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1) });
-    let paced = !has("--unpaced");
-    println!("running (arrows/Enter/Backspace = remote, F1-F5 buttons, +/- GPS speed, G GPS stop/go, T tunnel, P pause, S screenshot, F9 save state, Esc quit)");
+    let mut paced = !has("--unpaced");
+    println!("running (arrows/Enter/Backspace = remote, F1-F5 buttons, +/- GPS speed, G GPS stop/go, R radar, T tunnel, P pause, S screenshot, F full speed, F9 save state, Esc quit)");
 
     // Audio: SSI0 frames are pushed into a shared queue; the output callback resamples to the device rate.
     let audio: Arc<Mutex<VecDeque<(i16, i16)>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -64,6 +65,7 @@ fn main() {
             if let Some(cmd) = cmd { m.board.ir.press(m.steps, cmd, 0); }
             match k {
                 Key::P => { paused = !paused; clock = Instant::now(); emu_at_clock = m.steps; }
+                Key::F => { paced = !paced; clock = Instant::now(); emu_at_clock = m.steps; println!("{}", if paced { "real-time speed" } else { "full speed" }); }
                 Key::S => if let Some((w, h, px)) = m.compose_rgba() {
                     let (w, h, px) = rotate_ccw(w, h, &px);
                     let name = format!("screenshot-{shot:03}.bmp");
@@ -134,7 +136,7 @@ fn main() {
             if let Some(o) = &m.board.obd2 { extra += &format!("  OBD {:.0} rpm{}", o.car.rpm, if o.streaming { "" } else { " (idle)" }); }
             if let Some(d) = &m.board.dvr { extra += &format!("  DVR {}", if d.polls > 0 { "linked" } else { "waiting" }); }
             if let Some(w) = &m.board.sdhi1.card { extra += &format!("  Wi-Fi {}", w.connected.map_or("off-line".into(), |i| w.aps[i].ssid.clone())); }
-            window.set_title(&format!("AR-W53GA emulator  {speed:.2}x real time  {:.1}s{extra}{}", m.steps as f64 / P0_HZ, if paused { "  [paused]" } else if !status.is_empty() { "  [stopped]" } else { "" }));
+            window.set_title(&format!("AR-W53GA emulator  {speed:.2}x real time{}  {:.1}s{extra}{}", if paced { "" } else { " (full speed)" }, m.steps as f64 / P0_HZ, if paused { "  [paused]" } else if !status.is_empty() { "  [stopped]" } else { "" }));
             last_title = Instant::now(); title_steps = m.steps; title_t = Instant::now();
         }
     }

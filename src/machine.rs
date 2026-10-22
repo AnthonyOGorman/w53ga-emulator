@@ -656,10 +656,14 @@ impl Machine {
         loop {
             let n = limit - self.sub as usize;
             // the PC history as executing those instructions would leave it (the last 64 of them)
-            for i in n.saturating_sub(64)..n {
+            let first = n.saturating_sub(64);
+            let mut q = (self.spin.phase + first) % k;
+            for i in first..n {
                 let at = (self.hist_pos + i) & 63;
-                self.history[at] = self.spin.states[(self.spin.phase + i) % k].pc;
+                self.history[at] = self.spin.states[q].pc;
                 self.hist_irq[at] = false;
+                q += 1;
+                if q == k { q = 0; }
             }
             self.hist_pos += n;
             self.board.mmio_accesses += self.spin_reads(self.spin.phase, n);

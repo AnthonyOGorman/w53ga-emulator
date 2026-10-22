@@ -123,13 +123,16 @@ pub struct Machine {
     /// states (`save_state_to`). While it runs, the CPU carries its trace (`Cpu::trace`).
     #[serde(skip)]
     pub detect: Option<Box<crate::detect::Detector>>,
+    /// Decoded code in flash for `Cpu::run`.
+    #[serde(skip)]
+    blocks: crate::cpu::BlockCache,
 }
 
 impl Machine {
     pub fn from_checkpoint(flash: Vec<u8>, c: &Checkpoint) -> Result<Machine, String> {
         let mut cpu = Cpu::new(Memory::new(flash));
         c.apply(&mut cpu);
-        Ok(Machine { cpu, board: Board::from_checkpoint(c)?, steps: c.steps, interrupts: 0, history: [0; 64], hist_irq: [false; 64], hist_pos: 0, cpu_per_p0: 1, sub: 0, p0_batch: 1, call_counts: None, gfx_hle: false, gfx: Default::default(), hooks: Default::default(), idle_skip: false, idle_skipped: 0, irq_hist: Default::default(), stop_pc: std::env::var("AR_SH_STOP_PC").ok().and_then(|v| u32::from_str_radix(&v, 16).ok()), resets: 0, arg_log: arg_log_env(), debug_hooks: false, detect: None })
+        Ok(Machine { cpu, board: Board::from_checkpoint(c)?, steps: c.steps, interrupts: 0, history: [0; 64], hist_irq: [false; 64], hist_pos: 0, cpu_per_p0: 1, sub: 0, p0_batch: 1, call_counts: None, gfx_hle: false, gfx: Default::default(), hooks: Default::default(), idle_skip: false, idle_skipped: 0, irq_hist: Default::default(), stop_pc: std::env::var("AR_SH_STOP_PC").ok().and_then(|v| u32::from_str_radix(&v, 16).ok()), resets: 0, arg_log: arg_log_env(), debug_hooks: false, detect: None, blocks: Default::default() })
     }
 
     /// The unit as power is applied: the chip's power-on reset state (`Checkpoint::power_on`), the flash image as
@@ -189,19 +192,7 @@ impl Machine {
         if let Some(power_on) = self.board.wdt.reset.take() { self.chip_reset(power_on).map_err(Stop::Model)?; }
         // Idle loop head named by the HLE profile: with interrupts unmasked and nothing deliverable, no task can become
         // ready, so only the peripherals advance until an interrupt is due.
-        if self.idle_skip && Some(self.cpu.pc) == self.hooks.idle_loop && self.cpu.imask() == 0 {
-            let deliverable = self.board.pending_request().is_some_and(|(_, l)| l > 0);
-            if !deliverable {
-                self.sub = 0; // the rest of this tick's instruction slots are idle too
-                self.board.p0_per_step = self.p0_batch as u64;
-                self.steps += self.p0_batch as u64;
-                self.idle_skipped += self.p0_batch as u64;
-                crate::prof::set(crate::prof::BOARD);
-                self.board.tick_with(&mut self.cpu.mem);
-                if let Some(f) = self.board.fault.take() { return Err(Stop::Model(f)); }
-                return Ok(());
-            }
-        }
+        if self.idle_now() { return self.idle_tick(); }
         if let Some((v, l)) = self.board.pending_request() {
             if l > self.cpu.imask() {
                 self.cpu.take_interrupt(&mut self.board, v, l, true).map_err(Stop::Cpu)?;
@@ -240,6 +231,24 @@ impl Machine {
         Ok(())
     }
 
+    /// At the idle loop head with interrupts unmasked and nothing deliverable (`step` then skips the CPU).
+    #[inline]
+    fn idle_now(&mut self) -> bool {
+        self.idle_skip && Some(self.cpu.pc) == self.hooks.idle_loop && self.cpu.imask() == 0 && !self.board.pending_request().is_some_and(|(_, l)| l > 0)
+    }
+
+    /// A tick of the peripherals with the CPU idle.
+    fn idle_tick(&mut self) -> Result<(), Stop> {
+        self.sub = 0; // the rest of this tick's instruction slots are idle too
+        self.board.p0_per_step = self.p0_batch as u64;
+        self.steps += self.p0_batch as u64;
+        self.idle_skipped += self.p0_batch as u64;
+        crate::prof::set(crate::prof::BOARD);
+        self.board.tick_with(&mut self.cpu.mem);
+        if let Some(f) = self.board.fault.take() { return Err(Stop::Model(f)); }
+        Ok(())
+    }
+
     /// The development hooks AR_SH_STOP_PC and AR_SH_ARG_LOG, checked before an instruction only while a hook is set
     /// (`debug_hooks`, refreshed by `run`; --count-calls is counted in `step`).
     #[cold]
@@ -268,6 +277,7 @@ impl Machine {
         cpu.float_mode = self.cpu.float_mode;
         cpu.mem.flash_cmd_mode = false;
         self.cpu = cpu;
+        self.blocks.invalidate();
         self.board.chip_reset(&c)?;
         self.resets += 1;
         eprintln!("[reset] watchdog {} reset at step {}: pc {:08x} sp {:08x}", if power_on { "power-on" } else { "manual" }, self.steps, self.cpu.pc, self.cpu.r[15]);
@@ -489,9 +499,11 @@ impl Machine {
     pub fn run(&mut self, n: u64) -> Result<(), Stop> {
         self.debug_hooks = self.stop_pc.is_some() || !self.arg_log.is_empty() || self.call_counts.is_some();
         let end = self.steps + n;
-        self.cpu.code_may_have_changed();
+        self.blocks.invalidate();
         while self.steps < end {
-            if self.debug_hooks || self.board.wdt.reset.is_some() || self.detect.as_ref().is_some_and(|d| d.verify.is_some()) { self.step()?; } else { self.run_fast()?; }
+            if self.debug_hooks || self.board.wdt.reset.is_some() || self.detect.as_ref().is_some_and(|d| d.verify.is_some()) { self.step()?; }
+            else if self.idle_now() { self.idle_tick()?; } // as `step` would (no reset is pending)
+            else { self.run_fast()?; }
         }
         Ok(())
     }
@@ -507,7 +519,7 @@ impl Machine {
         let (hooks, hooks_range) = match self.hooks.rgah_range { Some(r) if self.gfx_hle => (&self.hooks.rgah[..], r), _ => (&[][..], (1, 0)) };
         let mut lim = crate::cpu::RunLimits { budget: limit - self.sub, idle_pc, irq_level, hooks, hooks_range, history: &mut self.history, hist_irq: &mut self.hist_irq, hist_pos: &mut self.hist_pos };
         crate::prof::set(crate::prof::CPU);
-        let (done, r) = self.cpu.run(&mut self.board, &mut lim);
+        let (done, r) = self.cpu.run(&mut self.board, &mut lim, &mut self.blocks);
         self.sub += done;
         match r.map_err(Stop::Cpu)? {
             crate::cpu::RunExit::Budget => {}

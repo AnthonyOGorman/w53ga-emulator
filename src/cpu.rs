@@ -91,9 +91,6 @@ pub struct Cpu {
     /// A data access went to the MMIO bus (a device) since `run` started its current instruction.
     #[serde(skip)]
     io_touched: bool,
-    /// Decoded code in flash (`run`).
-    #[serde(skip)]
-    blocks: BlockCache,
     /// Call/return/branch observer for runtime HLE detection (`crate::detect`); None when not detecting.
     #[serde(skip)]
     pub trace: Option<Box<crate::detect::Trace>>,
@@ -111,7 +108,7 @@ impl Cpu {
         Cpu {
             r: [0; 16], sr: 0xF0, gbr: 0, vbr: 0, mach: 0, macl: 0, pr: 0, pc: 0, tbr: 0,
             fpscr: 0x0004_0001, fpul: 0, fr: [0; 16], banks: [Bank::default(); 15], mem,
-            float_mode: FloatMode::Hardware, sleeping: false, cur_pc: 0, watch: None, watch_log: Vec::new(), bank_anomalies: 0, fault: None, io_touched: false, blocks: BlockCache::default(), trace: None,
+            float_mode: FloatMode::Hardware, sleeping: false, cur_pc: 0, watch: None, watch_log: Vec::new(), bank_anomalies: 0, fault: None, io_touched: false, trace: None,
         }
     }
 
@@ -258,15 +255,11 @@ impl Cpu {
     /// Each instruction is exactly what `step` would execute; only the machine's checks between instructions are
     /// reduced to the ones that can change without a device access.
     ///
-    /// Code in flash runs from decoded blocks (`BlockCache`): within a block nothing the checks look at can change, so
-    /// they are made once at its first instruction.
-    pub fn run<M: Mmio>(&mut self, io: &mut M, l: &mut RunLimits) -> (u32, Result<RunExit, Fault>) {
-        let io: &mut dyn Mmio = io;
-        let mut cache = std::mem::take(&mut self.blocks);
-        if cache.gen != self.mem.code_gen { cache.gen = self.mem.code_gen; cache.epoch = cache.epoch.wrapping_add(1); }
-        let r = self.run_with(io, l, &mut cache);
-        self.blocks = cache;
-        r
+    /// Code in flash runs from decoded blocks (`cache`, kept by the caller for this CPU's memory): within a block
+    /// nothing the checks look at can change, so they are made once at its first instruction.
+    pub fn run<M: Mmio>(&mut self, io: &mut M, l: &mut RunLimits, cache: &mut BlockCache) -> (u32, Result<RunExit, Fault>) {
+        if cache.gen != self.mem.code_gen { cache.gen = self.mem.code_gen; cache.invalidate(); }
+        self.run_with(io, l, cache)
     }
 
     #[inline(always)]
@@ -322,10 +315,6 @@ impl Cpu {
             if done >= l.budget { return (done, Ok(RunExit::Budget)); }
         }
     }
-
-    /// Code in flash may have been changed from outside the CPU (a new image, a test): blocks are compared with flash
-    /// again before they next run. `Machine::run` calls this on every call.
-    pub fn code_may_have_changed(&mut self) { self.blocks.epoch = self.blocks.epoch.wrapping_add(1); }
 
     /// Execute the slot instruction of a delayed branch at `slot_pc`.
     #[inline(always)]
@@ -630,6 +619,10 @@ const MAX_BLOCK: usize = 64;
 const MAX_DECODED: usize = 1 << 20;
 
 impl BlockCache {
+    /// Flash may have been changed from outside the CPU (a new image, a test): blocks are compared with it again before
+    /// they next run. `Machine::run` calls this on every call.
+    pub fn invalidate(&mut self) { self.epoch = self.epoch.wrapping_add(1); }
+
     /// The block starting at `pc`, decoded first if needed; None when `pc` is not an instruction address in flash.
     #[inline(always)]
     fn block(&mut self, flash: &[u8], pc: u32) -> Option<usize> {

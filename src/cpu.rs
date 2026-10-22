@@ -88,6 +88,9 @@ pub struct Cpu {
     /// The fault of the instruction that failed, passed from its handler to `exec`.
     #[serde(skip)]
     fault: Option<Fault>,
+    /// A data access went to the MMIO bus (a device) since `run` started its current instruction.
+    #[serde(skip)]
+    io_touched: bool,
     /// Call/return/branch observer for runtime HLE detection (`crate::detect`); None when not detecting.
     #[serde(skip)]
     pub trace: Option<Box<crate::detect::Trace>>,
@@ -105,7 +108,7 @@ impl Cpu {
         Cpu {
             r: [0; 16], sr: 0xF0, gbr: 0, vbr: 0, mach: 0, macl: 0, pr: 0, pc: 0, tbr: 0,
             fpscr: 0x0004_0001, fpul: 0, fr: [0; 16], banks: [Bank::default(); 15], mem,
-            float_mode: FloatMode::Hardware, sleeping: false, cur_pc: 0, watch: None, watch_log: Vec::new(), bank_anomalies: 0, fault: None, trace: None,
+            float_mode: FloatMode::Hardware, sleeping: false, cur_pc: 0, watch: None, watch_log: Vec::new(), bank_anomalies: 0, fault: None, io_touched: false, trace: None,
         }
     }
 
@@ -144,7 +147,7 @@ impl Cpu {
         if a as usize & (n - 1) != 0 { return Err(Fault::Address { pc: self.cur_pc, addr: a, size: n, write: false }); }
         let v = match self.mem.read_fast(a, n) {
             Some(v) => v,
-            None => match self.mem.read_plain(a, n) { Some(v) => v as u32, None => io.read(self.cur_pc, a, n) as u32 },
+            None => match self.mem.read_plain(a, n) { Some(v) => v as u32, None => { self.io_touched = true; io.read(self.cur_pc, a, n) as u32 } },
         };
         if let Some((s, e)) = self.watch { if a < e && a + n as u32 > s && self.watch_log.len() < 100_000 { self.watch_log.push((self.cur_pc, a, n, false, v)); } }
         Ok(v)
@@ -154,6 +157,7 @@ impl Cpu {
         if a as usize & (n - 1) != 0 { return Err(Fault::Address { pc: self.cur_pc, addr: a, size: n, write: true }); }
         if let Some((s, e)) = self.watch { if a < e && a + n as u32 > s && self.watch_log.len() < 100_000 { self.watch_log.push((self.cur_pc, a, n, true, v)); } }
         if !self.mem.write_fast(a, n, v) && !self.mem.write_plain(a, n, v as u64) {
+            self.io_touched = true;
             io.write(self.cur_pc, a, n, v as u64);
             if crate::periph::nor::Nor::handles(a) { self.mem.flash_cmd_mode = io.flash_cmd_mode(); }
         }
@@ -226,6 +230,37 @@ impl Cpu {
         self.cur_pc = pc;
         let op = self.fetch(pc)?;
         self.exec(io, op, pc, false)
+    }
+
+    /// Run instructions until `l.budget` is used up or the machine must look at something before or after an
+    /// instruction (see `RunLimits`, `RunExit`). Returns the instructions completed (a faulting one is not counted).
+    /// Each instruction is exactly what `step` would execute; only the machine's checks between instructions are
+    /// reduced to the ones that can change without a device access.
+    pub fn run<M: Mmio>(&mut self, io: &mut M, l: &mut RunLimits) -> (u32, Result<RunExit, Fault>) {
+        let io: &mut dyn Mmio = io;
+        let (lo, hi) = l.hooks_range;
+        let mut done = 0;
+        self.io_touched = false;
+        loop {
+            let pc = self.pc;
+            let imask = (self.sr >> 4) & 15;
+            if l.irq_level > imask || (pc == l.idle_pc && imask == 0) || (pc >= lo && pc <= hi && l.hooks.iter().any(|h| h.0 == pc)) {
+                return (done, Ok(RunExit::Check));
+            }
+            let k = *l.hist_pos & 63;
+            l.history[k] = pc;
+            l.hist_irq[k] = false;
+            *l.hist_pos += 1;
+            self.cur_pc = pc;
+            let r = match self.fetch(pc) { Ok(op) => self.exec(io, op, pc, false), Err(f) => Err(f) };
+            if let Err(f) = r { return (done, Err(f)); }
+            done += 1;
+            if self.io_touched || self.trace.as_ref().is_some_and(|t| t.event) {
+                self.io_touched = false;
+                return (done, Ok(RunExit::After(pc)));
+            }
+            if done >= l.budget { return (done, Ok(RunExit::Budget)); }
+        }
     }
 
     /// Execute the slot instruction of a delayed branch at `slot_pc`.
@@ -457,6 +492,36 @@ impl Cpu {
         if sz { self.w32(io, a, self.fr[m & 14])?; self.w32(io, a.wrapping_add(4), self.fr[m | 1])?; } else { self.w32(io, a, self.fr[m])?; }
         Ok(())
     }
+}
+
+/// Stop conditions of `Cpu::run`: the checks the machine makes before each instruction (`Machine::step`) that can
+/// change without a device access, and the instruction history it keeps.
+pub struct RunLimits<'a> {
+    /// Instructions to run at most (up to the next peripheral tick).
+    pub budget: u32,
+    /// Stop at this PC while SR.IMASK is 0: the idle loop to skip (1: none).
+    pub idle_pc: u32,
+    /// Stop when this interrupt priority level is above SR.IMASK: a pending request would be accepted (0: none).
+    pub irq_level: u32,
+    /// Stop at these PCs: entry points handled in software (sorted, as `Hooks::rgah`); `hooks_range` is the first and
+    /// last ((1, 0): none).
+    pub hooks: &'a [(u32, u8)],
+    pub hooks_range: (u32, u32),
+    /// Ring of the last 64 executed PCs (`Machine::history`).
+    pub history: &'a mut [u32; 64],
+    pub hist_irq: &'a mut [bool; 64],
+    pub hist_pos: &'a mut usize,
+}
+
+/// Why `Cpu::run` stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunExit {
+    /// The budget is used up.
+    Budget,
+    /// The next instruction needs the machine's checks first (idle loop, interrupt acceptance, a hooked entry point).
+    Check,
+    /// The instruction at this PC accessed a device or raised a detection event: the machine handles that next.
+    After(u32),
 }
 
 // ---------- instruction handlers ----------

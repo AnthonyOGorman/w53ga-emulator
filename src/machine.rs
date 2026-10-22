@@ -484,11 +484,45 @@ impl Machine {
         out
     }
 
-    /// Run for `n` peripheral clocks (P0 ticks).
+    /// Run for `n` peripheral clocks (P0 ticks). The same as calling `step` until then, but runs of instructions that
+    /// need none of `step`'s checks go through `Cpu::run` (see `run_fast`).
     pub fn run(&mut self, n: u64) -> Result<(), Stop> {
         self.debug_hooks = self.stop_pc.is_some() || !self.arg_log.is_empty() || self.call_counts.is_some();
         let end = self.steps + n;
-        while self.steps < end { self.step()?; }
+        while self.steps < end {
+            if self.debug_hooks || self.board.wdt.reset.is_some() || self.detect.as_ref().is_some_and(|d| d.verify.is_some()) { self.step()?; } else { self.run_fast()?; }
+        }
+        Ok(())
+    }
+
+    /// Instructions up to the next peripheral tick, as `step` would run them: the CPU runs on alone while nothing
+    /// that `step` checks before an instruction can change, which needs a device access (then the CPU stops after that
+    /// instruction) or a tick (the budget ends there). Whenever a check applies to the next instruction (idle loop, an
+    /// interrupt to accept, a hooked entry point), that step is left to `step`.
+    fn run_fast(&mut self) -> Result<(), Stop> {
+        let limit = self.cpu_per_p0 * self.p0_batch;
+        let irq_level = self.board.pending_request().map_or(0, |(_, l)| l);
+        let idle_pc = if self.idle_skip { self.hooks.idle_loop.unwrap_or(1) } else { 1 };
+        let (hooks, hooks_range) = match self.hooks.rgah_range { Some(r) if self.gfx_hle => (&self.hooks.rgah[..], r), _ => (&[][..], (1, 0)) };
+        let mut lim = crate::cpu::RunLimits { budget: limit - self.sub, idle_pc, irq_level, hooks, hooks_range, history: &mut self.history, hist_irq: &mut self.hist_irq, hist_pos: &mut self.hist_pos };
+        crate::prof::set(crate::prof::CPU);
+        let (done, r) = self.cpu.run(&mut self.board, &mut lim);
+        self.sub += done;
+        match r.map_err(Stop::Cpu)? {
+            crate::cpu::RunExit::Budget => {}
+            crate::cpu::RunExit::Check => return self.step(),
+            crate::cpu::RunExit::After(pc0) => {
+                if self.cpu.trace.is_some() { self.detect_check(pc0); }
+                if self.cpu_per_p0 > 1 { self.board.flush_deferred(&mut self.cpu.mem); }
+            }
+        }
+        if self.sub < limit { return Ok(()); }
+        self.sub = 0;
+        self.board.p0_per_step = self.p0_batch as u64;
+        self.steps += self.p0_batch as u64;
+        crate::prof::set(crate::prof::BOARD);
+        self.board.tick_with(&mut self.cpu.mem);
+        if let Some(f) = self.board.fault.take() { return Err(Stop::Model(f)); }
         Ok(())
     }
 

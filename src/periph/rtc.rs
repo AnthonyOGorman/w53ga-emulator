@@ -97,8 +97,8 @@ impl Rtc {
         if self.v(0x26) == 0 { return Ok(()); }
         // EXTAL = P0 x 2/5: count without dividing on the per-step path.
         self.extal_remainder += ticks * 2;
-        let mut extal = 0;
-        while self.extal_remainder >= 5 { self.extal_remainder -= 5; extal += 1; }
+        let extal = self.extal_remainder / 5;
+        self.extal_remainder %= 5;
         if extal == 0 { return Ok(()); }
         let divisor = (((self.v(0x2A) & 7) as u64) << 16) | self.v(0x2C) as u64;
         if divisor == 0 { return Err("RTC zero divider".into()); }

@@ -728,7 +728,7 @@ impl Board {
         self.wdt.tick(self.p0_per_step);
         crate::prof::set(crate::prof::AUDIO);
         if self.src.enabled() {
-            if self.src.quiescent() { self.src.tick(); } else { for _ in 0..self.p0_per_step { self.src.tick(); if self.src.quiescent() { self.src.tick(); break; } } }
+            if self.src.quiescent() { self.src.tick_quiescent(); } else { for _ in 0..self.p0_per_step { self.src.tick(); if self.src.quiescent() { self.src.tick_quiescent(); break; } } }
         }
         if let Some(s) = &mut self.ssi { s.tick(self.p0_per_step); }
         crate::prof::set(crate::prof::TIMERS);

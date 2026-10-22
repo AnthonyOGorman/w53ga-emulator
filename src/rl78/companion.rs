@@ -30,6 +30,12 @@ pub struct Companion {
     breaks: Vec<u32>,
     /// GNSS receiver on UART0.
     pub gnss: Option<crate::gnss::Gnss>,
+    /// Radar transmitters the radar receiver can hear.
+    #[serde(default)]
+    pub radar: crate::radar::Scene,
+    /// Debug taps from the environment (read once).
+    #[serde(skip)]
+    taps: Option<Box<Taps>>,
     /// Diagnostics: RL78 PC histogram when enabled.
     #[serde(skip)]
     pub pc_hist: Option<std::collections::HashMap<u32, u64>>,
@@ -51,7 +57,7 @@ impl Companion {
         let mut g13 = G13::default();
         g13.logging = false;
         Companion { cpu: Rl78::new(flash), g13, frac: 0, scif_cursor: 0, fault: None, log_link: std::env::var_os("AR_LINK_LOG").is_some(), pending: [Vec::new(), Vec::new()], frames: Vec::new(), now: 0,
-            breaks: std::env::var("AR_RL78_BREAK").map(|v| v.split(',').filter_map(|x| u32::from_str_radix(x, 16).ok()).collect()).unwrap_or_default(), gnss: None, pc_hist: None, resets: 0 }
+            breaks: std::env::var("AR_RL78_BREAK").map(|v| v.split(',').filter_map(|x| u32::from_str_radix(x, 16).ok()).collect()).unwrap_or_default(), gnss: None, radar: Default::default(), taps: None, pc_hist: None, resets: 0 }
     }
     /// Re-read the debug environment switches (after loading a saved state).
     pub fn refresh_debug_env(&mut self) {
@@ -74,7 +80,7 @@ impl Companion {
         let old = std::mem::take(&mut self.g13);
         let mut g = G13::default();
         g.logging = false;
-        g.spi = old.spi; g.pins = old.pins; g.adc_inputs = old.adc_inputs; g.boot_swap = old.boot_swap; g.fsl_log = old.fsl_log;
+        g.spi = old.spi; g.pins = old.pins; g.rx = old.rx; g.adc_inputs = old.adc_inputs; g.boot_swap = old.boot_swap; g.fsl_log = old.fsl_log;
         g.sfr[0xA8] = 0x10; // RESF.WDTRF
         self.cpu = cpu;
         self.g13 = g;
@@ -136,12 +142,14 @@ impl Companion {
         self.frac += (p0 * NUM) as i64;
         crate::prof::set(crate::prof::RL78);
         // `frac` counts fCLK cycles x DEN available; each instruction consumes its clock count.
-        let debug = !self.breaks.is_empty() || self.pc_hist.is_some();
+        let taps = self.taps.get_or_insert_with(|| Box::new(Taps::from_env()));
+        let debug = !self.breaks.is_empty() || self.pc_hist.is_some() || !taps.hits.is_empty();
         while self.frac >= DEN as i64 {
             if self.fault.is_some() { self.frac = 0; break; }
             if debug {
                 if !self.breaks.is_empty() && self.breaks.contains(&self.cpu.pc) { self.dump(); }
                 if let Some(h) = &mut self.pc_hist { *h.entry(self.cpu.pc).or_default() += 1; }
+                if let Some(t) = &mut self.taps { t.hit(self.now, self.cpu.pc); }
             }
             // halted with nothing pending: skip to the next peripheral event (the same cycles as stepping one by one)
             if self.cpu.halted && !self.cpu.stopped && !debug {
@@ -166,6 +174,9 @@ impl Companion {
             g.tick(self.now, &mut out);
             if !out.is_empty() { self.g13.uart_receive(GPS_UART, &out); }
         }
+        let pos = self.gnss.as_ref().map(|g| { let f = g.current(); (f.lat, f.lon) });
+        if let Some(t) = &mut self.taps { if t.active { t.after_batch(self.now, &self.cpu); } }
+        self.g13.rx.radar = self.radar.strength(self.now as f64 / (100.0e6 / 3.0), pos);
         if let Some(s) = scif {
             if s.tx_log.len() > self.scif_cursor {
                 let new = s.tx_log[self.scif_cursor..].to_vec();
@@ -178,6 +189,48 @@ impl Companion {
                 s.queue_rx(&out);
                 self.record(1, &out);
             }
+        }
+    }
+}
+
+/// Debug taps on the controller, set by environment variables (read once):
+/// - AR_RL78_PEEK=addr,addr,... (hex RAM addresses): print a byte whenever it has changed since the last batch;
+/// - AR_RL78_HITS=addr,addr,... (hex code addresses): print when the controller executes them (at most twice a second each);
+/// - AR_RL78_SAMPLE=1: print the controller's PC and the top of its stack every half second (where its time goes).
+#[derive(Default)]
+struct Taps {
+    active: bool,
+    peek: Vec<(u32, Option<u8>)>,
+    hits: Vec<(u32, u64)>,
+    sample: bool,
+    next_sample: u64,
+}
+
+impl Taps {
+    fn from_env() -> Taps {
+        let list = |name: &str| std::env::var(name).map(|v| v.split(',').filter_map(|x| u32::from_str_radix(x.trim(), 16).ok()).collect::<Vec<u32>>()).unwrap_or_default();
+        let peek: Vec<(u32, Option<u8>)> = list("AR_RL78_PEEK").into_iter().map(|a| (a, None)).collect();
+        let hits: Vec<(u32, u64)> = list("AR_RL78_HITS").into_iter().map(|a| (a, 0)).collect();
+        let sample = std::env::var_os("AR_RL78_SAMPLE").is_some();
+        Taps { active: !peek.is_empty() || sample, peek, hits, sample, next_sample: 0 }
+    }
+
+    fn hit(&mut self, now: u64, pc: u32) {
+        if let Some(e) = self.hits.iter_mut().find(|e| e.0 == pc) {
+            if now >= e.1 { eprintln!("[hit] {now:>12} {pc:05x}"); e.1 = now + 16_666_666; }
+        }
+    }
+
+    fn after_batch(&mut self, now: u64, cpu: &Rl78) {
+        if self.sample && now >= self.next_sample {
+            self.next_sample = now + 16_666_666;
+            let sp = cpu.sp() as u32;
+            let st: String = (0..16).map(|i| format!("{:02x}", cpu.ram.get((0xF0000 + sp + i - 0xF7F00) as usize).copied().unwrap_or(0))).collect();
+            eprintln!("[sample] {now:>12} pc {:05x} sp {sp:04x} {st}", cpu.pc);
+        }
+        for (a, last) in &mut self.peek {
+            let v = cpu.ram.get(a.wrapping_sub(0xF7F00) as usize).copied().unwrap_or(0);
+            if *last != Some(v) { eprintln!("[peek] {now:>12} {a:05x} = {v:02x}"); *last = Some(v); }
         }
     }
 }

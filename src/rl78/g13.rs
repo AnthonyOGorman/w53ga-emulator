@@ -46,6 +46,9 @@ pub struct G13 {
     /// Accepted interrupts per flag index.
     #[serde(with = "serde_big_array::BigArray")]
     pub irq_count: [u64; IFN],
+    /// The receiver's synthesizer, programmed over port 2.
+    #[serde(default)]
+    pub rx: super::receiver::Receiver,
     /// Earliest cycle at which any timer fires (fast path for `tick`).
     next_event: u64,
 }
@@ -74,7 +77,7 @@ const TAU_IRQ: [[usize; 8]; 2] = [[20, 21, 22, 23, 31, 32, 33, 34], [43, 44, 45,
 impl Default for G13 {
     fn default() -> Self {
         let mut g = G13 { reset_request: false, sfr: [0; 0x100], sfr2: vec![0; 0x800], log: BTreeMap::new(), logging: true, cycles: 0, watch: None, cur_pc: 0, pins: [0xFF; 16], tau: Default::default(), sau: Default::default(), spi: super::spiflash::SpiFlash::provisioned(), fsl_ram: vec![0; 0x800], boot_swap: 0, fsl_log: std::env::var_os("AR_FSL_LOG").is_some(),
-            irq_dirty: true, cached: None, adc_inputs: [(0x80u8, 1.05 / 3.3), (0x81u8, 1.45 / 3.3)].into_iter().collect(), adc_seen: Default::default(), irq_count: [0; IFN], next_event: u64::MAX };
+            irq_dirty: true, cached: None, adc_inputs: [(0x80u8, 1.05 / 3.3), (0x81u8, 1.45 / 3.3)].into_iter().collect(), adc_seen: Default::default(), irq_count: [0; IFN], next_event: u64::MAX, rx: Default::default() };
         // reset values: MK all ones, PR all ones
         for a in [0xE4, 0xE5, 0xE6, 0xE7, 0xD4, 0xD5, 0xD6, 0xE8, 0xE9, 0xEA, 0xEB, 0xEC, 0xED, 0xEE, 0xEF, 0xD8, 0xD9, 0xDA, 0xDC, 0xDD, 0xDE] { g.sfr[a] = 0xFF; }
         for a in 0x20..0x30 { g.sfr[a] = 0xFF; } // PMx
@@ -356,6 +359,7 @@ impl Rl78Bus for G13 {
         if let Some((lo, hi)) = self.watch { if (lo..hi).contains(&a) { eprintln!("[rl78] {:05x}: read {a:05x}", self.cur_pc); } }
         if self.logging { self.log.entry(a).or_insert((0, 0, 0)).0 += 1; }
         match a {
+            0xFFF03 => { let pm = self.sfr[0x23]; let pins = if self.rx.comparator_low(self.sfr[3] & 1 != 0) { self.pins[3] & !2 } else { self.pins[3] }; return (self.sfr[3] & !pm) | (pins & pm); }
             0xFFF00..=0xFFF0F => { let i = (a - 0xFFF00) as usize; let pm = self.sfr[0x20 + i]; return (self.sfr[i] & !pm) | (self.pins[i] & pm); }
             0xFFFA2 => return 0xFF, // OSTC: oscillation stable
             // Boot-ROM flash firmware information block: last code-flash block (512 x 1 KiB), fCLK range 1..32 MHz.
@@ -388,13 +392,19 @@ impl Rl78Bus for G13 {
             // WDTE: anything but ACh is an illegal write and resets the chip (the firmware's software reset,
             // `ONEB !WDTE` at 00176, used after a firmware update).
             0xFFFAB => { if v != 0xAC { self.reset_request = true; } return; }
+            0xFFF02 => { let old = self.sfr[2]; self.sfr[2] = v; self.rx.port2(self.cycles, old, v); return; }
+            0xFFF00 | 0xFFF07 => { self.sfr[(a - 0xFFF00) as usize] = v; self.rx.sweep_pins(self.sfr[0], self.sfr[7]); return; }
             0xFFF30 => { // ADM0: ADCS (bit 7) with ADCE (bit 0) starts a conversion; it completes at once (ADIF, ADCR)
                 self.sfr[0x30] = v;
                 if v & 0x81 == 0x81 {
                     let ch = self.sfr[0x31];
                     if self.adc_seen.insert(ch) { eprintln!("[rl78 adc] first conversion of channel {ch:02x}"); }
-                    let f = self.adc_inputs.get(&ch).copied().unwrap_or(0.5).clamp(0.0, 1.0);
+                    let mut f = self.adc_inputs.get(&ch).copied().unwrap_or(0.5);
+                    if ch == 0 { f += self.rx.detector(self.sfr[3] & 1 != 0); } // radar detector on ANI0
+                    let f = f.clamp(0.0, 1.0);
                     let code = ((f * 1023.0).round() as u16) << 6;
+                    if ch == 0 && self.rx.logging() { eprintln!("[rx] {:>12} ANI0 {f:.3} (sweep {})", self.cycles, self.rx.sweep); }
+                    if ch == 1 && self.rx.logging() { eprintln!("[rx] {:>12} ANI1 {f:.3} (channel {:06x}, P2.6 {})", self.cycles, self.rx.channel, self.rx.enabled as u8); }
                     self.sfr[0x1E] = code as u8; self.sfr[0x1F] = (code >> 8) as u8;
                     self.request(24);
                     if self.sfr[0x32] & 0x20 != 0 { self.sfr[0x30] &= !0x80; } // one-shot conversion mode: ADCS clears

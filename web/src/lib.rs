@@ -256,6 +256,10 @@ pub unsafe extern "C" fn emu_gps_route(p: *const u8, n: usize, speed: f64, hold:
 #[no_mangle]
 pub extern "C" fn emu_gps_speed(speed: f64) { with(|e| if let Some(g) = e.m.board.companion.as_mut().and_then(|c| c.gnss.as_mut()) { g.speed_kmh = speed.max(0.0); }); }
 
+/// Strength (0-1, 0 = none) of a radar the unit's radar receiver hears, as if a speed trap were ahead.
+#[no_mangle]
+pub extern "C" fn emu_radar(strength: f64) { with(|e| if let Some(c) = e.m.board.companion.as_mut() { c.radar.manual = strength.clamp(0.0, 1.0); }); }
+
 /// Plug the OBD-II adapter / drive recorder in or out.
 #[no_mangle]
 pub extern "C" fn emu_accessories(obd2: i32, dvr: i32) {

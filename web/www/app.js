@@ -186,6 +186,7 @@ async function start(mode) {
       cid: $('in-cid').value.trim(),
       obd2: $('acc-obd2').checked, dvr: $('acc-dvr').checked, wifi: $('acc-wifi').checked ? $('in-ssid').value : '',
       route: car ? `${car[0]},${car[1]}` : '35.6812,139.7671', speed: +$('gps-speed').value,
+      radar: +$('radar-strength').value / 100,
     };
     init.flash = await files.flash.arrayBuffer();
     init.profile = files.profile ? await files.profile.text() : '';
@@ -297,6 +298,11 @@ $('route-sample').addEventListener('change', async () => {
   try { sendRoute(await (await fetch(v)).text(), false); } catch (e) { msg('Route not loaded: ' + e.message, 'err'); }
 });
 $('in-route').addEventListener('change', async () => { const f = $('in-route').files[0]; if (f) sendRoute(await f.text(), false); });
+$('radar-strength').addEventListener('input', () => {
+  const v = +$('radar-strength').value;
+  $('radar-strength-v').textContent = v ? `${v} %` : 'off';
+  started && worker.postMessage({ cmd: 'radar', strength: v / 100 });
+});
 $('gps-speed').addEventListener('input', () => { $('gps-speed-v').textContent = `${speed()} km/h`; started && worker.postMessage({ cmd: 'speed', speed: speed() }); });
 // manual driving: a straight line ahead in the chosen heading, re-aimed on every turn
 function ahead(p, deg, km) {

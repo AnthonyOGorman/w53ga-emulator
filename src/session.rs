@@ -31,6 +31,8 @@ pub struct Options {
     /// GPS route "lat,lon;lat,lon;..." or "@FILE", speed in km/h.
     pub gps: Option<String>,
     pub gps_speed: Option<f64>,
+    /// Radar transmitters for the radar receiver (see `radar::Scene::parse`).
+    pub radar: Option<String>,
 }
 
 pub const OPTIONS_HELP: &str = "\
@@ -49,7 +51,10 @@ pub const OPTIONS_HELP: &str = "\
   --dvr                   plug in the drive recorder and its camera
   --wifi [SSID[:PASS]]    fit the Wi-Fi module with one virtual access point bridged to this computer's network
   --gps ROUTE             drive the GNSS receiver along \"lat,lon;lat,lon;...\" or @FILE (one point per line)
-  --gps-speed KMH         route speed (default 50)";
+  --gps-speed KMH         route speed (default 50)
+  --radar SPEC            radar the unit can hear, entries separated by ';': LAT,LON[,RANGE_M] a radar at that
+                          place (default range 1000 m, stronger when closer), @FROM-TO[:STRENGTH] a radar from
+                          FROM to TO emulated seconds (strength 0-1, default 0.7)";
 
 impl Options {
     /// Parse the options above from `args` (other arguments are left for the caller).
@@ -70,6 +75,7 @@ impl Options {
             dvr: has("--dvr"),
             wifi: if has("--wifi") { Some(opt("--wifi").unwrap_or_default()) } else { None },
             gps: opt("--gps"),
+            radar: opt("--radar"),
             gps_speed: opt("--gps-speed").map(|s| s.parse().map_err(|_| format!("--gps-speed: not a number: {s}"))).transpose()?,
             ..Default::default()
         };
@@ -130,6 +136,7 @@ impl Options {
                 g.start_after = c.now() + 3_333_333;
                 c.gnss = Some(g);
             }
+            if let Some(r) = &self.radar { c.radar = crate::radar::Scene::parse(r)?; }
         }
         Ok(m)
     }

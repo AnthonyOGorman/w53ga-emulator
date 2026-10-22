@@ -7,5 +7,6 @@ pub mod dis;
 pub mod g13;
 pub mod companion;
 pub mod spiflash;
+pub mod receiver;
 
 pub use cpu::{Rl78, Rl78Bus, Rl78Fault};

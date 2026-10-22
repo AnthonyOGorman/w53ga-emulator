@@ -169,6 +169,7 @@ onmessage = async (e) => {
         ex.emu_accessories(m.obd2 ? 1 : 0, m.dvr ? 1 : 0);
         str(m.wifi || '', ex.emu_wifi); wifi = !!m.wifi;
         if (m.route) str(m.route, ex.emu_gps_route, m.speed, 1);
+        if (m.radar) ex.emu_radar(m.radar);
         ex.emu_status();
         const profile = JSON.parse(text()).profile;
         running = true; paused = false; emuMs = 0; wallStart = performance.now(); statusWall = wallStart; statusEmu = 0;
@@ -179,6 +180,7 @@ onmessage = async (e) => {
       case 'key': ex.emu_key(m.code); break;
       case 'route': if (str(m.route, ex.emu_gps_route, m.speed, m.hold ? 1 : 0) !== 0) postMessage({ type: 'error', message: 'GPS: ' + text() }); break;
       case 'speed': ex.emu_gps_speed(m.speed); break;
+      case 'radar': ex.emu_radar(m.strength); break;
       case 'accessories': ex.emu_accessories(m.obd2 ? 1 : 0, m.dvr ? 1 : 0); break;
       case 'wifi': str(m.spec, ex.emu_wifi); wifi = !!m.spec; break;
       case 'obd': ex.emu_obd(m.speed, m.rpm, m.coolant, m.intake, m.throttle, m.load, m.boost, m.battery, m.follow ? 1 : 0); break;

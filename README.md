@@ -106,7 +106,7 @@ target/release/w53ga --flash FLASH.bin --rl78 CONTROLLER.bin --sd path/to/SDCard
 
 | Binary | Purpose |
 |---|---|
-| `w53ga` | Window with the unit's screen at real-time speed, keyboard as the remote, audio out. Keys as in the browser, plus <kbd>+</kbd>/<kbd>-</kbd> GPS speed, <kbd>G</kbd> GPS stop/go, <kbd>F9</kbd> save state, <kbd>Esc</kbd> quit. |
+| `w53ga` | Window with the unit's screen at real-time speed, keyboard as the remote, audio out. Keys as in the browser, plus <kbd>+</kbd>/<kbd>-</kbd> GPS speed, <kbd>G</kbd> GPS stop/go, <kbd>R</kbd> radar off/weak/medium/strong, <kbd>F9</kbd> save state, <kbd>Esc</kbd> quit. |
 | `w53ga-headless` | Runs for a set emulated time without a window; writes screenshots (`--frame`, `--every`), saved states, audio (`--wav`), memory dumps. Also writes HLE profiles (`--make-profile`). |
 | `w53ga-serve` | Tiny local web server for the browser version (127.0.0.1 only), with the Wi-Fi relay. |
 | `rl78-run` | The RL78 controller on its own: disassembler, traces, SFR access report (a development tool). |
@@ -121,14 +121,23 @@ Common options (all front ends; `--help` lists them):
 --sd-readonly           keep the software's SD card writes in this session only; the folder is never changed
 --sd-add CARD=HOST      add a host file to the card at CARD, never written back
 --sd-cid HEX            the card's CID (32 hex digits)
---rl78-spi FILE         the controller's serial flash contents (default: an empty, provisioned chip)
+--rl78-spi FILE         the controller's serial flash contents (default: an empty, provisioned chip; see below)
 --power-on-state FILE   SH7269 power-on reset state (when the build has none built in)
 --hle FILE|none         HLE profile (default: a built-in profile whose checks match the flash image, else
                         entry points detected at run time; none: no HLE)
 --obd2 / --dvr          plug in the OBD-II adapter / the drive recorder and its camera
 --wifi [SSID[:PASS]]    fit the Wi-Fi module with one virtual access point bridged to this computer's network
 --gps ROUTE             drive the GNSS receiver along "lat,lon;lat,lon;..." or @FILE; --gps-speed KMH
+--radar SPEC            radar the unit can hear, entries separated by ';': LAT,LON[,RANGE_M] a speed-trap radar at
+                        that place (default range 1000 m, stronger when closer), @FROM-TO[:STRENGTH] a radar from
+                        FROM to TO emulated seconds (strength 0-1, default 0.7)
 ```
+
+The controller keeps the GPS warning database in its serial flash. With the default empty chip it finds no end to
+the database and reads the whole chip on every pass of its main loop (about 18 s each), so its warnings, radar
+included, come late. Give it an image with the database installed (`--rl78-spi`): one way is to switch the unit on
+with the database update packages on the card (`--sd-add CELLSTAR/UPDATE/...`), let its updater install them, and
+save the chip (`w53ga-headless --dump-spi FILE`).
 
 Without `--sd-readonly`, what the unit wrote to its card is copied back into the SD folder when the emulator exits
 (new and changed files, new folders, deletions; nothing is written if the card's file system does not read back
@@ -165,6 +174,8 @@ cleanly or if more than 20 files would be deleted). Work on a copy of your card'
 | **Serial NOR flash** | 4 MiB SPI flash on the controller's CSI20 (read, page program, sector/block/chip erase, status, ID). |
 | **Controller link** | The real controller program talks to the main program over SCIF7 ⇄ UART1, as on the board. |
 | **GNSS receiver** | An NMEA receiver on the controller's UART0 (RMC/GGA/GNS/GSV with GPS and GLONASS satellites), driving along a route at a set speed, answering configuration commands. |
+| **Radar receiver** | The swept X/K-band receiver as the controller drives it: a 10-bit DAC on port pins (P0.5/P0.6, P7) tunes the oscillator, P3.0 powers the front end, a comparator on P3.1 fires while the detector output is above its threshold and the detector output is read on ANI0. A radar (`--radar`, the window's <kbd>R</kbd>, the page's Radar slider) shows as a peak at one sweep position whose height follows its strength; the controller finds it, measures it against the noise floor it calibrated and reports レーダー with a level from 1 to 5. |
+| **Radio receiver** | The PLL synthesizer of the 154-470 MHz scanner (24-bit words on P2.3/P2.4/P2.5, P2.6 tuned) is decoded so the scan can be followed (`AR_RX_LOG`); no transmitters are emulated yet, the signal level (ANI1) and squelch read as an empty band. |
 | **IR remote** | NEC-format remote (customer code 0x84E4) as demodulated edges into MTU1 input capture. |
 | **Wi-Fi module** | SDIO 802.11 module (SDIO manufacturer 0x032C), emulated at its host interface: CIS, function registers, firmware download (the module's own firmware, which the unit's flash supplies, is checksummed but not executed), configuration protocol, scan/join with WEP/WPA keys, and data frames to a user-mode network (DHCP, DNS, TCP/UDP through host sockets, like QEMU's user networking). |
 | **OBD-II adapter** | The accessory's serial protocol: presence, configuration, diagnosis and a live stream of speed, engine speed, temperatures, load, boost and battery voltage (from a simple gearbox model following the GPS speed, or set by hand). |
@@ -195,6 +206,7 @@ Measured with the unit's own software on the development machine.
 | Display | All layer formats, blending, fades, the video plane; the unit's map, menus, standby screens and camera screens render. 2D drawing through [HLE](#hle-profiles). |
 | Controller | The real controller program runs: link handshake, mode changes, settings, GPS handling, warning database in its serial flash. |
 | GPS | The map follows the emulated receiver; routes, manual driving, map clicks. |
+| Radar | Radar warnings through the unit's own receiver path: about 0.5 s after a radar appears the controller reports it (with its GPS warning database installed, see `--rl78-spi`) and the screen shows レーダー with the level following the strength. |
 | SD card | Read/write FAT32 card from a folder (native: write-back on exit; browser: write-back on request with a read/write folder). |
 | Audio | Key sounds and voice prompts through SRC/SSI to the host. |
 | OBD-II, drive recorder | Recognised by the unit; engine data and camera picture shown on its screens. |
@@ -348,6 +360,12 @@ sh scripts/build-web.sh               # browser build (scripts\build-web.bat on 
 The repository is a Cargo workspace: the emulator library and native binaries at the root, and the WebAssembly front
 end in `web/` (built only for `wasm32-unknown-unknown`). `.github/workflows/ci.yml` builds and tests on Linux, Windows
 and macOS and builds the WebAssembly front end.
+
+Diagnostics (environment variables, native builds): `AR_LINK_LOG=1` (or `full`) logs the controller link frames,
+`AR_MMIO_LOG=FILE` every main-CPU MMIO store, `AR_RX_LOG=1` the receivers (PLL words, radar and radio A/D samples),
+`AR_RL78_PEEK=addr,...` controller RAM bytes when they change, `AR_RL78_HITS=addr,...` when the controller executes
+those addresses, `AR_RL78_SAMPLE=1` the controller's PC and stack twice a second. `w53ga-headless --dump-rspi FILE`,
+`--dump-vdc FILE` and `--dump-mem` write peripheral traffic, display registers and memory at the end of a run.
 
 ## Screenshots
 

@@ -24,6 +24,7 @@ pub mod mem;
 pub mod obd2;
 pub mod periph;
 pub mod prof;
+pub mod radar;
 pub mod rl78;
 pub mod sdsync;
 pub mod session;

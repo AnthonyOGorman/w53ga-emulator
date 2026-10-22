@@ -268,12 +268,15 @@ impl Cpu {
         let hooks = l.hooks;
         let trace_on = self.trace.is_some();
         let mut done = 0;
+        // The history position stays in a register while instructions run (the handlers cannot see it) and is
+        // written back once.
+        let mut hp = *l.hist_pos;
         self.io_touched = false;
-        loop {
+        let r = 'run: loop {
             let pc = self.pc;
             let imask = (self.sr >> 4) & 15;
             if l.irq_level > imask || (pc == l.idle_pc && imask == 0) || (pc >= lo && pc <= hi && hooks.iter().any(|h| h.0 == pc)) {
-                return (done, Ok(RunExit::Check));
+                break (done, Ok(RunExit::Check));
             }
             if let Some(b) = cache.block(&self.mem.flash, pc) {
                 // The checks above hold for every instruction of the block: SR.IMASK changes only at its end, the
@@ -283,37 +286,39 @@ impl Cpu {
                 if !inside(l.idle_pc) && !(lo <= hi && hooks.iter().any(|h| inside(h.0))) {
                     let n = b.n.min(l.budget - done) as usize;
                     for e in &cache.ops[b.first as usize..b.first as usize + n] {
-                        let k = *l.hist_pos & 63;
+                        let k = hp & 63;
                         l.history[k] = e.pc;
                         l.hist_irq[k] = false;
-                        *l.hist_pos += 1;
+                        hp += 1;
                         self.cur_pc = e.pc;
                         self.pc = e.pc.wrapping_add(2);
-                        if !(e.f)(self, io, e.op) { return (done, Err(self.fault.take().unwrap_or(Fault::Illegal { pc: e.pc, op: e.op }))); }
+                        if !(e.f)(self, io, e.op) { break 'run (done, Err(self.fault.take().unwrap_or(Fault::Illegal { pc: e.pc, op: e.op }))); }
                         done += 1;
                         if self.io_touched || (trace_on && self.trace.as_ref().is_some_and(|t| t.event)) {
                             self.io_touched = false;
-                            return (done, Ok(RunExit::After(e.pc)));
+                            break 'run (done, Ok(RunExit::After(e.pc)));
                         }
                     }
-                    if done >= l.budget { return (done, Ok(RunExit::Budget)); }
+                    if done >= l.budget { break (done, Ok(RunExit::Budget)); }
                     continue;
                 }
             }
-            let k = *l.hist_pos & 63;
+            let k = hp & 63;
             l.history[k] = pc;
             l.hist_irq[k] = false;
-            *l.hist_pos += 1;
+            hp += 1;
             self.cur_pc = pc;
             let r = match self.fetch(pc) { Ok(op) => self.exec(io, op, pc, false), Err(f) => Err(f) };
-            if let Err(f) = r { return (done, Err(f)); }
+            if let Err(f) = r { break (done, Err(f)); }
             done += 1;
             if self.io_touched || self.trace.as_ref().is_some_and(|t| t.event) {
                 self.io_touched = false;
-                return (done, Ok(RunExit::After(pc)));
+                break (done, Ok(RunExit::After(pc)));
             }
-            if done >= l.budget { return (done, Ok(RunExit::Budget)); }
-        }
+            if done >= l.budget { break (done, Ok(RunExit::Budget)); }
+        };
+        *l.hist_pos = hp;
+        r
     }
 
     /// Execute the slot instruction of a delayed branch at `slot_pc`.

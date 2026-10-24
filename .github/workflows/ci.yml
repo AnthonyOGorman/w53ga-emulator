@@ -1,7 +1,9 @@
 name: CI
 
+# Pushes to main and pull requests; pushes to other branches (develop) do not run it.
 on:
   push:
+    branches: [main]
   pull_request:
 
 env:

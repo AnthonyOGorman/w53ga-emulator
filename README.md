@@ -108,8 +108,8 @@ target/release/w53ga --flash FLASH.bin --rl78 CONTROLLER.bin --sd path/to/SDCard
 
 | Binary | Purpose |
 |---|---|
-| `w53ga` | Window with the unit's screen at real-time speed, keyboard as the remote, audio out. Keys as in the browser (<kbd>T</kbd> tunnel included), plus <kbd>+</kbd>/<kbd>-</kbd> GPS speed, <kbd>G</kbd> GPS stop/go, <kbd>R</kbd> radar off/weak/medium/strong, <kbd>F</kbd> full speed (not paced to real time; also `--unpaced`), <kbd>F9</kbd> save state, <kbd>Esc</kbd> quit. |
-| `w53ga-headless` | Runs for a set emulated time without a window; writes screenshots (`--frame`, `--every`), saved states, audio (`--wav`), memory dumps, periodic memory and GPS readouts (`--peek`). Also writes HLE profiles (`--make-profile`). |
+| `w53ga` | Window with the unit's screen at real-time speed, keyboard as the remote, audio out. Keys as in the browser (<kbd>T</kbd> tunnel included; a remote key kept down sends the remote's repeat frames, as a held button), plus <kbd>+</kbd>/<kbd>-</kbd> GPS speed, <kbd>G</kbd> GPS stop/go, <kbd>R</kbd> radar off/weak/medium/strong, <kbd>F</kbd> full speed (not paced to real time; also `--unpaced`), <kbd>F9</kbd> save state, <kbd>Esc</kbd> quit. |
+| `w53ga-headless` | Runs for a set emulated time without a window; remote presses, held too (`--ir 12@70:3.5`); writes screenshots (`--frame`, `--every`), saved states, audio (`--wav`), memory dumps, periodic memory and GPS readouts (`--peek`). Also writes HLE profiles (`--make-profile`). |
 | `w53ga-serve` | Tiny local web server for the browser version (127.0.0.1 only), with the Wi-Fi relay. |
 | `rl78-run` | The RL78 controller on its own: disassembler, traces, SFR access report (a development tool). |
 
@@ -122,6 +122,8 @@ Common options (all front ends; `--help` lists them):
 --sd DIR                SD card folder (served as a FAT32 SDHC card; changes written back on exit)
 --sd-readonly           keep the software's SD card writes in this session only; the folder is never changed
 --sd-add CARD=HOST      add a host file to the card at CARD, never written back
+--sd-persist CARD=HOST  add a host file like --sd-add and write what the software left in it back on exit (also
+                        with --sd-readonly), e.g. a settings file or a log kept from run to run
 --sd-cid HEX            the card's CID (32 hex digits)
 --rl78-spi FILE         the controller's serial flash contents (default: an empty, provisioned chip; see below)
 --power-on-state FILE   SH7269 power-on reset state (when the build has none built in)
@@ -182,7 +184,7 @@ cleanly or if more than 20 files would be deleted). Work on a copy of your card'
 | **Radio receiver** | The PLL synthesizer of the 154-470 MHz scanner (24-bit words on P2.3/P2.4/P2.5, P2.6 tuned) is decoded so the scan can be followed (`AR_RX_LOG`); no transmitters are emulated yet, the signal level (ANI1) and squelch read as an empty band. |
 | **IR remote** | NEC-format remote (customer code 0x84E4) as demodulated edges into MTU1 input capture. |
 | **Wi-Fi module** | SDIO 802.11 module (SDIO manufacturer 0x032C), emulated at its host interface: CIS, function registers, firmware download (the module's own firmware, which the unit's flash supplies, is checksummed but not executed), configuration protocol, scan/join with WEP/WPA keys, and data frames to a user-mode network (DHCP, DNS, TCP/UDP through host sockets, like QEMU's user networking). |
-| **OBD-II adapter** | The accessory's serial protocol: presence, configuration, diagnosis and a live stream of speed, engine speed, temperatures, load, boost and battery voltage (from a simple gearbox model following the GPS speed, or set by hand). |
+| **OBD-II adapter** | The accessory's serial protocol: presence, configuration, diagnosis and a live stream of speed, engine speed, temperatures, load, boost and battery voltage (from a simple gearbox model following the GPS speed, or set by hand). Its answers are the real adapter's, which refuses the stream (error 1) unless the unit wrote its security and car-maker settings since the greeting. The car is switched off with `AR_OBD2_OFF_AT=S` (error frame, code 2, at emulated second S) or `AR_OBD2_SILENT_AT=S` (the stream just stops); `AR_OBD_LOG=1` prints the frames both ways (native front ends). |
 | **Drive recorder** | The accessory's control link (status polling, version, keys) and a synthetic NTSC camera picture of a road. |
 
 ### Memory map

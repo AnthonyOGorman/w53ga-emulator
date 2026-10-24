@@ -12,7 +12,8 @@ use w53ga_emu::session::{Options, OPTIONS_HELP};
 const P0_HZ: f64 = 100.0e6 / 3.0;
 
 fn usage() -> ! {
-    eprintln!("usage: w53ga-headless --flash FLASH.bin (--rl78 CONTROLLER.bin | --state SAVED.state) --seconds S [options]\n\n{OPTIONS_HELP}\n  --seconds S             emulated time to run (default 10)\n  --frame FILE.bmp        write the screen at the end (landscape, as the unit shows it)\n  --every S               with --frame: also write FILE-<t>.bmp every S emulated seconds\n  --ir CODE@S,...         remote presses: command code (hex) at emulated second S, e.g. 09@60,01@62\n  --save-state FILE       save the machine at the end (contains the flash image and RAM: keep it private)\n  --wav FILE              record the audio output\n  --dump-mem ADDR,LEN,FILE  write main-CPU memory (hex address and length) at the end\n  --save-flash FILE       write the NOR flash as it is at the end\n  --dump-rspi FILE        write the bytes sent on RSPI0 and RSPI1 (hex, one line per channel), e.g. the panel set-up\n  --dump-vdc FILE         write every VDC4 register (address, name, shadow and active value) at the end\n  --dump-spi FILE         write the controller's serial flash at the end (e.g. after the unit installed a database update)\n  --peek ADDR,LEN[;...]   print main-CPU memory (hex address and length) and the GPS state every --peek-every S\n                          emulated seconds (default 1)\n\nDiagnostics (environment): AR_MMIO_LOG=FILE logs every MMIO store; AR_LINK_LOG=1 (or full) logs the controller link.\n\nProfile writer (checks computed from the flash image; addresses in hex):\n  w53ga-headless --flash FLASH.bin --make-profile OUT.json --name NAME [--idle ADDR] [--rgah FILL,DRAW,BLT,BLTFC,FINISH]");
+    eprintln!("usage: w53ga-headless --flash FLASH.bin (--rl78 CONTROLLER.bin | --state SAVED.state) --seconds S [options]\n\n{OPTIONS_HELP}\n  --seconds S             emulated time to run (default 10)\n  --frame FILE.bmp        write the screen at the end (landscape, as the unit shows it)\n  --every S               with --frame: also write FILE-<t>.bmp every S emulated seconds\n  --ir CODE@S[:H],...     remote presses: command code (hex) at emulated second S, held H seconds (repeat frames
+                          every 108 ms), e.g. 09@60,01@62,12@70:3.5\n  --save-state FILE       save the machine at the end (contains the flash image and RAM: keep it private)\n  --wav FILE              record the audio output\n  --dump-mem ADDR,LEN,FILE  write main-CPU memory (hex address and length) at the end\n  --save-flash FILE       write the NOR flash as it is at the end\n  --dump-rspi FILE        write the bytes sent on RSPI0 and RSPI1 (hex, one line per channel), e.g. the panel set-up\n  --dump-vdc FILE         write every VDC4 register (address, name, shadow and active value) at the end\n  --dump-spi FILE         write the controller's serial flash at the end (e.g. after the unit installed a database update)\n  --dump-spi-reads FILE   log every read command on the controller's serial flash (hex address, bytes), e.g. its database look-ups\n  --peek ADDR,LEN[;...]   print main-CPU memory (hex address and length) and the GPS state every --peek-every S\n                          emulated seconds (default 1)\n\nDiagnostics (environment): AR_MMIO_LOG=FILE logs every MMIO store; AR_LINK_LOG=1 (or full) logs the controller link.\n\nProfile writer (checks computed from the flash image; addresses in hex):\n  w53ga-headless --flash FLASH.bin --make-profile OUT.json --name NAME [--idle ADDR] [--rgah FILL,DRAW,BLT,BLTFC,FINISH]");
     std::process::exit(2)
 }
 
@@ -67,13 +68,16 @@ fn main() {
     }
     let options = Options::parse(&args).unwrap_or_else(|e| { eprintln!("{e}"); usage() });
     let mut m = options.build().unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1) });
+    if let (Some(_), Some(c)) = (opt("--dump-spi-reads"), m.board.companion.as_mut()) { c.g13.spi.trace_reads = true; }
     let seconds: f64 = opt("--seconds").map_or(10.0, |s| s.parse().unwrap_or_else(|_| usage()));
     let frame = opt("--frame").map(PathBuf::from);
     let every: Option<f64> = opt("--every").map(|s| s.parse().unwrap_or_else(|_| usage()));
-    let mut presses: Vec<(u64, u8)> = opt("--ir").map(|s| s.split(',').map(|p| {
+    let mut presses: Vec<(u64, u8, u32)> = opt("--ir").map(|s| s.split(',').map(|p| {
         let (c, at) = p.split_once('@').unwrap_or_else(|| usage());
+        let (at, hold) = at.split_once(':').unwrap_or((at, "0"));
         let t: f64 = at.parse().unwrap_or_else(|_| usage());
-        ((t * P0_HZ) as u64, u8::from_str_radix(c.trim_start_matches("0x"), 16).unwrap_or_else(|_| usage()))
+        let h: f64 = hold.parse().unwrap_or_else(|_| usage());
+        ((t * P0_HZ) as u64, u8::from_str_radix(c.trim_start_matches("0x"), 16).unwrap_or_else(|_| usage()), (h / 0.108) as u32)
     }).collect()).unwrap_or_default();
     presses.sort();
     let peeks: Vec<(u32, u32)> = opt("--peek").map(|s| s.split(';').filter(|x| !x.is_empty()).map(|x| {
@@ -92,7 +96,7 @@ fn main() {
     let mut next_peek = if peeks.is_empty() { u64::MAX } else { start + peek_every };
     let mut result = Ok(());
     while m.steps < end {
-        while let Some(&(at, cmd)) = presses.first() { if at <= m.steps { m.board.ir.press(m.steps, cmd, 0); println!("remote 0x{cmd:02x} at t={:.2}s", m.steps as f64 / P0_HZ); presses.remove(0); } else { break; } }
+        while let Some(&(at, cmd, reps)) = presses.first() { if at <= m.steps { m.board.ir.press(m.steps, cmd, reps); println!("remote 0x{cmd:02x} at t={:.2}s ({reps} repeats)", m.steps as f64 / P0_HZ); presses.remove(0); } else { break; } }
         let next_press = presses.first().map_or(u64::MAX, |p| p.0);
         let stop = end.min(next_frame).min(next_peek).min(next_press.max(m.steps + 1));
         result = m.run(stop - m.steps);
@@ -122,6 +126,7 @@ fn main() {
     }
     if let Some(f) = &frame { save_frame(&m, f); }
     w53ga_emu::sdsync::sync_and_report(m.board.sdhi.as_mut().map(|s| &mut s.card));
+    w53ga_emu::sdsync::persist_and_report(m.board.sdhi.as_mut().map(|s| &mut s.card), &options.sd_persist);
     if let Some(p) = opt("--save-state") { match m.save_state(Path::new(&p)) { Ok(()) => println!("state saved: {p}"), Err(e) => println!("state not saved: {e}") } }
     if let Some(spec) = opt("--dump-mem") {
         let p: Vec<&str> = spec.splitn(3, ',').collect();
@@ -142,6 +147,10 @@ fn main() {
     if let (Some(p), Some(d)) = (opt("--dump-vdc"), &m.board.display) {
         let txt: String = d.vdc.regs.iter().map(|r| format!("{:08x} {:<12} {:<8} shadow {:08x} active {:08x}\n", r.address, r.name, r.group, r.shadow, r.active)).collect();
         match std::fs::write(&p, txt) { Ok(()) => println!("VDC4 registers written to {p}"), Err(e) => println!("{p}: {e}") }
+    }
+    if let (Some(p), Some(c)) = (opt("--dump-spi-reads"), &m.board.companion) {
+        let txt: String = c.g13.spi.reads.iter().map(|(a, n)| format!("{a:06x} {n}\n")).collect();
+        match std::fs::write(&p, txt) { Ok(()) => println!("controller serial flash reads written to {p} ({} commands)", c.g13.spi.reads.len()), Err(e) => println!("{p}: {e}") }
     }
     if let (Some(p), Some(c)) = (opt("--dump-spi"), &m.board.companion) {
         match std::fs::write(&p, &c.g13.spi.mem) { Ok(()) => println!("controller serial flash written to {p}"), Err(e) => println!("{p}: {e}") }

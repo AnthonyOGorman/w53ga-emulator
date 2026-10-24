@@ -182,12 +182,16 @@ impl Companion {
                 None => break,
                 Some(Err(k)) => { buf.drain(..k); }
                 Some(Ok(((seq, cmd, ev, st, stat, payload), n))) => {
+                    // main -> controller frames carry a 64-byte mirror block after the status byte (offset 11)
+                    let mirror: String = if dir == 0 && n >= 75 { buf[11..75].iter().map(|b| format!("{b:02x}")).collect() } else { String::new() };
                     buf.drain(..n);
                     if self.log_link {
-                        // AR_LINK_LOG=full: whole payloads; otherwise the first 48 bytes
-                        let lim = if std::env::var("AR_LINK_LOG").is_ok_and(|v| v == "full") { usize::MAX } else { 48 };
+                        // AR_LINK_LOG=full: whole payloads and the mirror block; otherwise the first 48 payload bytes
+                        let full = std::env::var("AR_LINK_LOG").is_ok_and(|v| v == "full");
+                        let lim = if full { usize::MAX } else { 48 };
                         let hex: String = payload.iter().take(lim).map(|b| format!("{b:02x}")).collect();
-                        eprintln!("[link] {:>11} {} seq {seq:3} cmd {cmd:02x} ev {ev:04x} st {st:04x} status {stat:02x} len {} {hex}{}", self.now, if dir == 0 { "SH->RL" } else { "RL->SH" }, payload.len(), if payload.len() > lim { "..." } else { "" });
+                        let mir = if full && !mirror.is_empty() { format!(" mirror {mirror}") } else { String::new() };
+                        eprintln!("[link] {:>11} {} seq {seq:3} cmd {cmd:02x} ev {ev:04x} st {st:04x} status {stat:02x} len {} {hex}{}{mir}", self.now, if dir == 0 { "SH->RL" } else { "RL->SH" }, payload.len(), if payload.len() > lim { "..." } else { "" });
                     }
                     self.frames.push((dir, self.now, seq, cmd, payload));
                 }

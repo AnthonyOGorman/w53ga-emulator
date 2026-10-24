@@ -984,7 +984,22 @@ impl Machine {
         let views: Vec<Option<LayerView>> = (0..GR.len()).map(|k| self.layer_view(k)).collect();
         let panel = views.iter().flatten().find(|l| l.width == w && l.height == h).map_or((0, 0), |l| l.origin);
         let mut any = self.draw_video_plane(w, h, panel, &index, out);
-        for l in views.into_iter().flatten() {
+        for (k, l) in views.into_iter().enumerate() {
+            // A layer whose frame buffer is not read still shows its background colour over the whole panel when
+            // GR_DISP_SEL is 0 (table 35.18: background colour inside and outside its graphics area): a top layer left
+            // at 0 hides everything below it on the real unit.
+            let Some(l) = l else {
+                if let Some(d) = self.board.display.as_ref() {
+                    let v = &d.vdc;
+                    if v.active(GR[k] + 0x20) & 3 == 0 {
+                        let base = v.active(GR[k] + 0x4C) as u32;
+                        let c = ((base & 0xFF) << 16) | (((base >> 16) & 0xFF) << 8) | ((base >> 8) & 0xFF);
+                        for y in 0..h { for x in 0..w { out[index(x, y)] = c; } }
+                        any = true;
+                    }
+                }
+                continue;
+            };
             if l.disp_sel == 1 && any { continue; }
             let (ox, oy) = (l.origin.0 - panel.0, l.origin.1 - panel.1);
             if l.width as i32 + ox <= 0 || l.height as i32 + oy <= 0 || ox >= w as i32 || oy >= h as i32 { continue; }

@@ -30,6 +30,10 @@ pub struct IrRemote {
     /// Earliest step a new press may start (previous press edges + release overflow).
     pub busy_until: u64,
     pub presses: u64,
+    /// Start of the last frame queued (the press or its last repeat frame), for `hold`; not saved, so states saved
+    /// before it load (a press held across a save/load just ends).
+    #[serde(skip)]
+    pub last_frame: u64,
 }
 
 impl IrRemote {
@@ -40,11 +44,46 @@ impl IrRemote {
         self.busy_until = e.last().unwrap() + us(130_000);
         self.edges.extend(e);
         self.presses += 1;
+        self.last_frame = start + repeats as u64 * us(108_000);
         start
+    }
+    /// The last press still held at `now` (a key kept down in the window): queue its next repeat frames, 108 ms
+    /// apart, up to 50 ms ahead. Once a frame's time has passed unqueued the receiver has seen the release, and
+    /// nothing more is queued for that press.
+    pub fn hold(&mut self, now: u64) {
+        while self.last_frame + us(108_000) <= now + us(50_000) {
+            let r0 = self.last_frame + us(108_000);
+            if r0 < now { return; }
+            self.edges.push_back(r0);
+            self.edges.push_back(r0 + us(11_250));
+            self.busy_until = r0 + us(11_250) + us(130_000);
+            self.last_frame = r0;
+        }
     }
     #[inline]
     /// An edge scheduled at or before `step` (batched ticks cover several steps).
     pub fn edge_at(&mut self, step: u64) -> bool {
         if self.edges.front().is_some_and(|&e| e <= step) { self.edges.pop_front(); true } else { false }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hold_sends_the_repeat_frames_of_a_held_press() {
+        // a key kept down, the window polling every 16 ms: the same edges as a press held for 10 repeat frames
+        let mut ir = IrRemote::default();
+        let start = ir.press(1000, 0x12, 0);
+        let mut now = 1000;
+        while ir.last_frame < start + 10 * us(108_000) { now += us(16_000); ir.hold(now); }
+        let want = press_edges(start, 0x12, 10);
+        assert_eq!(ir.edges.iter().copied().collect::<Vec<_>>(), want);
+        // released: nothing more; a frame time missed (the window not polled in time) ends the press too
+        let mut late = IrRemote::default();
+        let s = late.press(0, 0x12, 0);
+        late.hold(s + us(250_000));
+        assert_eq!(late.edges.len(), press_edges(s, 0x12, 0).len());
     }
 }

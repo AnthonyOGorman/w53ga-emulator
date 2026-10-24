@@ -664,7 +664,12 @@ impl Board {
         let edge = self.ir.edge_at(self.now);
         let running = r[i[0]].value & 2 != 0 && r[i[1]].value & 0x20 == 0;
         if !running {
-            if edge { self.fault.get_or_insert("IR edge while MTU1 stopped or gated".into()); }
+            // the unit not listening (e.g. a firmware starting while a key is still held): the signal is lost, as on
+            // the unit
+            static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if edge && !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("[ir] t={:.3}s remote signal while MTU1 is stopped or gated: lost (noted once)", self.now as f64 / (100.0e6 / 3.0));
+            }
             return;
         }
         if r[i[2]].value != 0x0B { if edge { self.fault.get_or_insert(format!("MTU1 TCR {:x} not modelled", r[i[2]].value)); } return; }

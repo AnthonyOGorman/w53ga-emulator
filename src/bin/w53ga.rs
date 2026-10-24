@@ -5,7 +5,7 @@
 //!        w53ga --flash FLASH.bin --state SAVED.state [--sd SDCARD-FOLDER] [options]
 //!
 //! Keys: arrows = remote up/down/left/right, Enter = ENT, Backspace = BACK, F1..F5 = the other remote buttons
-//! (codes 0x10, 0x11, 0x12, 0x64, 0xFF), +/- = GPS speed ±10 km/h, G = GPS stop/go, R = radar off/weak/medium/strong,
+//! (codes 0x10, 0x11, 0x12, 0x64, 0xFF; F3 = power), a remote key kept down sends the remote's repeat frames, +/- = GPS speed ±10 km/h, G = GPS stop/go, R = radar off/weak/medium/strong,
 //! T = tunnel (GPS sky blocked, the drive goes on), P = pause, S = screenshot (BMP), F = full speed (unpaced) on/off,
 //! F9 = save state, Esc = quit.
 
@@ -23,7 +23,7 @@ const W: usize = 400;
 const H: usize = 240;
 
 fn usage() -> ! {
-    eprintln!("usage: w53ga --flash FLASH.bin --rl78 CONTROLLER.bin [--sd FOLDER] [options]\n       w53ga --flash FLASH.bin --state SAVED.state [options]\n\n{OPTIONS_HELP}\n  --scale N               window scale (default 2)\n  --unpaced               run as fast as possible instead of real time (F switches while running)\n  --save-flash FILE       on exit, write the NOR flash as it is then (e.g. after a software update)\n\nKeys: arrows/Enter/Backspace = remote, F1-F5 = other remote buttons, +/- GPS speed, G GPS stop/go, R radar off/weak/medium/strong, T tunnel,\n      P pause, S screenshot, F full speed on/off, F9 save state, Esc quit.");
+    eprintln!("usage: w53ga --flash FLASH.bin --rl78 CONTROLLER.bin [--sd FOLDER] [options]\n       w53ga --flash FLASH.bin --state SAVED.state [options]\n\n{OPTIONS_HELP}\n  --scale N               window scale (default 2)\n  --unpaced               run as fast as possible instead of real time (F switches while running)\n  --save-flash FILE       on exit, write the NOR flash as it is then (e.g. after a software update)\n  --dump-spi FILE         on exit, write the controller's serial flash if it changed\n\nKeys: arrows/Enter/Backspace = remote, F1-F5 = other remote buttons, +/- GPS speed, G GPS stop/go, R radar off/weak/medium/strong, T tunnel,\n      P pause, S screenshot, F full speed on/off, F9 save state, Esc quit.");
     std::process::exit(2)
 }
 
@@ -36,7 +36,7 @@ fn main() {
     let options = Options::parse(&args).unwrap_or_else(|e| { eprintln!("{e}"); usage() });
     let mut m = options.build().unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1) });
     let mut paced = !has("--unpaced");
-    println!("running (arrows/Enter/Backspace = remote, F1-F5 buttons, +/- GPS speed, G GPS stop/go, R radar, T tunnel, P pause, S screenshot, F full speed, F9 save state, Esc quit)");
+    println!("running (arrows/Enter/Backspace = remote (kept down: held), F1-F5 buttons (F3 power), +/- GPS speed, G GPS stop/go, R radar, T tunnel, P pause, S screenshot, F full speed, F9 save state, Esc quit)");
 
     // Audio: SSI0 frames are pushed into a shared queue; the output callback resamples to the device rate.
     let audio: Arc<Mutex<VecDeque<(i16, i16)>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -49,6 +49,7 @@ fn main() {
     let mut status = String::new();
     let (mut shot, mut saves) = (0, 0);
     let mut gps_stopped_speed: Option<f64> = None;
+    let mut held: Option<Key> = None;     // the remote key kept down (its repeat frames)
     // Real-time pacing: emulated time is kept in step with the host clock (catching up at most 100 ms at a time).
     let mut clock = Instant::now();
     let mut emu_at_clock = m.steps;
@@ -62,7 +63,7 @@ fn main() {
                 Key::Enter => Some(0x09), Key::Backspace => Some(0x0A), Key::F1 => Some(0x10), Key::F2 => Some(0x11),
                 Key::F3 => Some(0x12), Key::F4 => Some(0x64), Key::F5 => Some(0xFF), _ => None,
             };
-            if let Some(cmd) = cmd { m.board.ir.press(m.steps, cmd, 0); }
+            if let Some(cmd) = cmd { m.board.ir.press(m.steps, cmd, 0); held = Some(k); }
             match k {
                 Key::P => { paused = !paused; clock = Instant::now(); emu_at_clock = m.steps; }
                 Key::F => { paced = !paced; clock = Instant::now(); emu_at_clock = m.steps; println!("{}", if paced { "real-time speed" } else { "full speed" }); }
@@ -94,6 +95,7 @@ fn main() {
                 _ => {}
             }
         }
+        if let Some(k) = held { if window.is_key_down(k) { if !paused { m.board.ir.hold(m.steps); } } else { held = None; } }
         if !paused && status.is_empty() {
             // Emulate up to the host clock (or one 1/60 s slice when unpaced), bounded by a 25 ms host budget.
             let target = if paced { emu_at_clock + (clock.elapsed().as_secs_f64() * P0_HZ) as u64 } else { m.steps + (P0_HZ / 60.0) as u64 };
@@ -143,6 +145,11 @@ fn main() {
     w53ga_emu::machine::mmio_log_flush();
     // What the software wrote to the SD card goes back to the SD folder (--sd-readonly: never).
     w53ga_emu::sdsync::sync_and_report(m.board.sdhi.as_mut().map(|s| &mut s.card));
+    w53ga_emu::sdsync::persist_and_report(m.board.sdhi.as_mut().map(|s| &mut s.card), &options.sd_persist);
+    if let (Some(p), Some(c)) = (opt("--dump-spi"), &m.board.companion) {
+        if !c.g13.spi.dirty { println!("controller serial flash unchanged; {p} not written"); }
+        else { match std::fs::write(&p, &c.g13.spi.mem) { Ok(()) => println!("controller serial flash written to {p}"), Err(e) => println!("{p}: {e}") } }
+    }
     if let Some(p) = opt("--save-flash") {
         if m.board.nor.erases + m.board.nor.programs == 0 { println!("flash unchanged; {p} not written"); }
         else { match std::fs::write(&p, &m.cpu.mem.flash) { Ok(()) => println!("flash image written to {p} ({} erases, {} programs)", m.board.nor.erases, m.board.nor.programs), Err(e) => println!("flash image not written: {e}") } }

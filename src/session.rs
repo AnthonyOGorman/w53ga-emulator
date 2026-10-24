@@ -20,6 +20,8 @@ pub struct Options {
     /// SD card folder, extra files (card path, host file), keep the folder unchanged, card CID.
     pub sd: Option<PathBuf>,
     pub sd_add: Vec<(String, PathBuf)>,
+    /// Added files whose final content goes back to the host file at exit (`--sd-persist`; also in `sd_add`).
+    pub sd_persist: Vec<(String, PathBuf)>,
     pub sd_readonly: bool,
     pub sd_cid: Option<String>,
     /// HLE profile: None = automatic (built-in profiles), Some("none") = off, Some(path).
@@ -44,6 +46,8 @@ pub const OPTIONS_HELP: &str = "\
   --sd DIR                SD card folder (served as a FAT32 SDHC card; changes written back on exit)
   --sd-readonly           keep the software's SD card writes in this session only; the folder is never changed
   --sd-add CARD=HOST      add a host file to the card at CARD (e.g. FOLDER/FILE.BIN=path), never written back
+  --sd-persist CARD=HOST  add a host file to the card like --sd-add, and write what the software left in it back to
+                          the host file on exit (also with --sd-readonly): settings kept from run to run
   --sd-cid HEX            the card's CID (32 hex digits), for data bound to a particular card
   --rl78-spi FILE         the controller's serial flash contents (default: empty, provisioned chip)
   --power-on-state FILE   SH7269 power-on reset state (when this build has none built in)
@@ -85,10 +89,11 @@ impl Options {
             ..Default::default()
         };
         for (i, a) in args.iter().enumerate() {
-            if a == "--sd-add" {
-                let spec = args.get(i + 1).ok_or("--sd-add needs CARD=HOST")?;
-                let (c, h) = spec.split_once('=').ok_or("--sd-add needs CARD=HOST")?;
+            if a == "--sd-add" || a == "--sd-persist" {
+                let spec = args.get(i + 1).ok_or(format!("{a} needs CARD=HOST"))?;
+                let (c, h) = spec.split_once('=').ok_or(format!("{a} needs CARD=HOST"))?;
                 o.sd_add.push((c.to_string(), PathBuf::from(h)));
+                if a == "--sd-persist" { o.sd_persist.push((c.to_string(), PathBuf::from(h))); }
             }
         }
         Ok(o)

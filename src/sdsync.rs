@@ -177,6 +177,31 @@ pub fn sync_back(card: &mut VirtualSd) -> Result<Vec<String>, String> {
     Ok(done)
 }
 
+/// Files added with `--sd-persist` (card path, host file): what the software left in them is written to their host
+/// files, whatever the folder's mode. Returns the files written.
+pub fn persist_back(card: &mut VirtualSd, files: &[(String, std::path::PathBuf)]) -> Result<Vec<String>, String> {
+    if files.is_empty() { return Ok(Vec::new()); }
+    let mut done = Vec::new();
+    for c in changes(card)? {
+        let Change::Write { path, data, .. } = c else { continue };
+        let Some((_, host)) = files.iter().find(|(cp, _)| cp.trim_start_matches('/').eq_ignore_ascii_case(&path)) else { continue };
+        if std::fs::read(host).is_ok_and(|d| d == data) { continue; }
+        std::fs::write(host, &data).map_err(|err| format!("{}: {err}", host.display()))?;
+        done.push(format!("{path} -> {} ({} bytes)", host.display(), data.len()));
+    }
+    Ok(done)
+}
+
+/// `persist_back` on a machine's card, printed.
+pub fn persist_and_report(card: Option<&mut VirtualSd>, files: &[(String, std::path::PathBuf)]) {
+    let Some(card) = card else { return };
+    match persist_back(card, files) {
+        Ok(c) if c.is_empty() => {}
+        Ok(c) => { println!("kept for the next run:"); for l in c { println!("  {l}"); } }
+        Err(e) => println!("--sd-persist files not written: {e}"),
+    }
+}
+
 /// `sync_back` on a machine's card, printed (front ends call this when they stop).
 pub fn sync_and_report(card: Option<&mut VirtualSd>) {
     let Some(card) = card else { return };
